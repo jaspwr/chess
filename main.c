@@ -935,7 +935,7 @@ void castle(GameState* gs, Castle c) {
         }
 
         gs->side[gs->turn].rook_k_moved = true;
-    } else if (gs->turn == S_BLACK) {
+    } else if (c == CASTLE_Q) {
         if (gs->turn == S_WHITE) {
             gs->side[gs->turn].piece[P_KING] = sq("c1");
             gs->side[gs->turn].piece[P_ROOK] &= ~sq("a1");
