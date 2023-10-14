@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 #include <nmmintrin.h>
 
 typedef enum { false, true } bool;
@@ -30,13 +31,24 @@ typedef struct {
     bool king_moved;
     bool rook_k_moved;
     bool rook_q_moved;
+    bool did_castle;
 } Side;
+
+typedef enum {
+    R_PLAYING,
+    R_WHITE_WON,
+    R_BLACK_WON,
+    R_DRAW,
+} GameResult;
 
 typedef struct {
     SideId turn;
     Side side[2];
     Board en_passant;
     Board all_pieces;
+    GameResult game_result;
+    u64 seen_position_hashes[1000];
+    int seen_position_hashes_count;
 } GameState;
 
 typedef enum {
@@ -106,6 +118,27 @@ Board _side_pieces(SideId side, GameState* gs) {
     return b;
 }
 
+u64 hash_position(GameState* gs) {
+    u64 hash = 0xc0ffeeUL;
+    for (u64 i = 0UL; i < 6UL; i++) {
+        hash ^= gs->side[S_WHITE].piece[i];
+        hash += i;
+        hash ^= gs->side[S_BLACK].piece[i];
+        hash += i;
+    }
+
+    hash += gs->turn;
+    hash ^= gs->en_passant * 111UL;
+    hash ^= gs->side[S_WHITE].king_moved * 222UL;
+    hash ^= gs->side[S_WHITE].rook_k_moved * 333UL;
+    hash ^= gs->side[S_WHITE].rook_q_moved * 444UL;
+    hash ^= gs->side[S_BLACK].king_moved * 555UL;
+    hash ^= gs->side[S_BLACK].rook_k_moved* 666UL;
+    hash ^= gs->side[S_BLACK].rook_q_moved * 777UL;
+
+    return hash;
+}
+
 void print_bitboard(Board board) {
     for (int row = 7; row >= 0; row--) {
         for (int col = 0; col < 8; col++) {
@@ -144,11 +177,11 @@ Position pos_from_row_and_col(int row, int col) {
     return row * 8 + col;
 }
 
-Board pos_id_to_bit_mask(Position pos) {
+Board pos_to_bitboard(Position pos) {
     return 1UL << pos;
 }
 
-Position translate_notation_to_pos(char* str) {
+Position notation_to_pos(char* str) {
     assert(((str[0] >= 'a' && str[0] <= 'h')
         || (str[0] >= 'A' && str[0] <= 'H'))
         && str[1] >= '1' && str[1] <= '8');
@@ -165,7 +198,7 @@ bool position_is_legal(Position pos) {
     return pos >= 0 && pos < 64;
 }
 
-void translate_pos_to_notation(Position pos, char* buf) {
+void pos_to_notation(Position pos, char* buf) {
     assert(position_is_legal(pos));
 
     int row = row_from_pos(pos);
@@ -191,7 +224,7 @@ char promotion_to_notation(Promotion promo) {
     }
 }
 
-void translate_move_to_notation(Move move, char* buf) {
+void move_to_notation(Move move, char* buf) {
     if (move.data.castle != CASTLE_NONE) {
         if (move.data.castle == CASTLE_K) {
             (void)memcpy(buf, "O-O", 4);
@@ -202,9 +235,8 @@ void translate_move_to_notation(Move move, char* buf) {
         return;
     }
 
-
-    (void)translate_pos_to_notation(move.data.from, buf);
-    (void)translate_pos_to_notation(move.data.to, buf + 2);
+    (void)pos_to_notation(move.data.from, buf);
+    (void)pos_to_notation(move.data.to, buf + 2);
     int len = 4;
 
     if (move.data.promotion != PROMO_NONE) {
@@ -216,7 +248,7 @@ void translate_move_to_notation(Move move, char* buf) {
 }
 
 Piece piece_at(Position pos, GameState* gs) {
-    Board b = pos_id_to_bit_mask(pos);
+    Board b = pos_to_bitboard(pos);
 
     for (int i = 0; i < 6; i++) {
         if (((gs->side[S_WHITE].piece[i] & b)
@@ -229,7 +261,7 @@ Piece piece_at(Position pos, GameState* gs) {
     assert(false);
 }
 
-Move translate_notation_to_move(char* buf, GameState* gs) {
+Move notation_to_move(char* buf, GameState* gs) {
     Move move = { 0 };
 
     if (strcmp(buf, "O-O-O") == 0) {
@@ -241,8 +273,8 @@ Move translate_notation_to_move(char* buf, GameState* gs) {
         return move;
     }
 
-    move.data.from = translate_notation_to_pos(buf);
-    move.data.to = translate_notation_to_pos(buf + 2);
+    move.data.from = notation_to_pos(buf);
+    move.data.to = notation_to_pos(buf + 2);
 
     if (buf[4] != 0) {
         switch (buf[4]) {
@@ -273,7 +305,7 @@ typedef struct {
     Position* positions;
 } PositionList;
 
-#define sq(s) pos_id_to_bit_mask(translate_notation_to_pos(s))
+#define sq(s) pos_to_bitboard(notation_to_pos(s))
 
 void position_offset(Position pos, int row, int col, PositionList* out) {
     int row_ = (int)row_from_pos(pos);
@@ -292,7 +324,7 @@ void position_offset(Position pos, int row, int col, PositionList* out) {
 Board position_list_to_bitboard(PositionList* list) {
     Board b = 0;
     for (int i = 0; i < list->length; i++) {
-        b |= pos_id_to_bit_mask(list->positions[i]);
+        b |= pos_to_bitboard(list->positions[i]);
     }
     return b;
 }
@@ -301,44 +333,18 @@ int set_bits_count(Board value) {
     return _mm_popcnt_u64(value);
 }
 
-PositionList bitboard_to_position_list(Board b) {
+int bitscan_reverse(Board value) {
+    return __builtin_ctzll(value);
+}
+
+void bitboard_to_position_list(Board b, PositionList* out) {
     int pos_count = set_bits_count(b);
 
-    Position* list = malloc(sizeof(Position) * pos_count);
-    int length = 0;
-    for (Position pos = 0; pos < 64; pos++) {
-        if ((b >> pos) & 1UL) {
-            list[length++] = pos;
-            if (length == pos_count) {
-                break;
-            }
-        }
+    while (b != 0) {
+        int pos = bitscan_reverse(b);
+        out->positions[out->length++] = pos;
+        b &= ~(1UL << pos);
     }
-
-    PositionList pl = { 0 };
-    pl.positions = list;
-    pl.length = length;
-    return pl;
-}
-
-float material_eval(GameState* gs) {
-    float eval = 0;
-
-    for (Piece p = 0; p < 6; p++) {
-        int white_count = set_bits_count(gs->side[S_WHITE].piece[p]);
-        int black_count = set_bits_count(gs->side[S_BLACK].piece[p]);
-        eval += (float)(PIECE_VALUES[p] * (white_count - black_count));
-    }
-
-    return eval;
-}
-
-float evaluate(GameState* gs) {
-    float mat = material_eval(gs);
-    float checks = -gs->side[S_WHITE].in_check + gs->side[S_BLACK].in_check;
-    float castle_status = gs->side[S_WHITE].can_castle_k + gs->side[S_WHITE].can_castle_q
-        - (gs->side[S_BLACK].can_castle_k + gs->side[S_BLACK].can_castle_q);
-    return mat + castle_status * 0.2 + 0.8 * checks;
 }
 
 typedef struct {
@@ -346,7 +352,7 @@ typedef struct {
     Board en_passant_moves;
 } PawnMoves;
 
-#define CHECK_PINS Board __pos_mask = pos_id_to_bit_mask(pos); \
+#define CHECK_PINS Board __pos_mask = pos_to_bitboard(pos); \
     Board __pinned_mask = gs->side[gs->turn].pinned_pieces; \
     if ((__pos_mask & __pinned_mask) != 0) { \
         return 0; \
@@ -354,7 +360,7 @@ typedef struct {
 
 void assert_piece_exists(Piece p, Position pos, GameState* gs) {
     assert(position_is_legal(pos));
-    assert(gs->side[gs->turn].piece[p] & pos_id_to_bit_mask(pos));
+    assert(gs->side[gs->turn].piece[p] & pos_to_bitboard(pos));
 }
 
 Board pawn_attacks(Position pos, GameState* gs) {
@@ -380,7 +386,7 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
     SideId side_id = gs->turn;
     SideId op_side = !side_id;
 
-    Board pawn_mask = pos_id_to_bit_mask(pos);
+    Board pawn_mask = pos_to_bitboard(pos);
     Board pinned_mask = gs->side[gs->turn].pinned_pieces;
     if ((pawn_mask & pinned_mask) != 0) {
         PawnMoves pm = { 0 };
@@ -409,7 +415,7 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
         assert(advances_list.length == 1);
 
 
-        Board advance_mask = pos_id_to_bit_mask(advances_list.positions[0]);
+        Board advance_mask = pos_to_bitboard(advances_list.positions[0]);
 
         if ((advance_mask & gs->all_pieces) == 0) {
             (void)position_offset(pos, y_dir * 2, 0, &advances_list);
@@ -429,7 +435,11 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
         & position_list_to_bitboard(&en_passant_targets_list);
 
     if (en_passants != 0) {
-        PositionList ml = bitboard_to_position_list(en_passants);
+        PositionList ml = { 0 };
+        Position move_list[64] = { 0 };
+        ml.positions = move_list;
+
+        bitboard_to_position_list(en_passants, &ml);
 
         for (int i = 0; i < ml.length; i++) {
             Position p = ml.positions[i];
@@ -441,17 +451,17 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
             (void)position_offset(p, y_dir, 0, &en_passant_list);
 
             if (en_passant_list.length > 0) {
-                moves |= pos_id_to_bit_mask(en_passant_list.positions[0]);
-                en_passant_moves |= pos_id_to_bit_mask(en_passant_list.positions[0]);
+                moves |= pos_to_bitboard(en_passant_list.positions[0]);
+                en_passant_moves |= pos_to_bitboard(en_passant_list.positions[0]);
             }
         }
-
-        free(ml.positions);
     }
 
     if (gs->side[gs->turn].in_check) {
         moves &= gs->side[gs->turn].check_attack_path;
     }
+
+    moves &= ~(gs->side[S_WHITE].piece[P_KING] | gs->side[S_BLACK].piece[P_KING]);
 
     PawnMoves pm = { 0 };
     pm.all_moves = moves;
@@ -522,6 +532,8 @@ Board knight_legal_moves(Position pos, GameState* gs) {
         moves &= gs->side[gs->turn].check_attack_path;
     }
 
+    moves &= ~(gs->side[S_WHITE].piece[P_KING] | gs->side[S_BLACK].piece[P_KING]);
+
     return moves;
 }
 
@@ -560,7 +572,10 @@ Board sliding_piece_attacks(Position pos, GameState* gs, const PosOffset* offset
 
             Position p = move_list.positions[move_list.length - 1];
 
-            if (gs->all_pieces & pos_id_to_bit_mask(p)) {
+            Board pieces = gs->all_pieces &
+                ~gs->side[!gs->turn].piece[P_KING];
+
+            if (pieces & pos_to_bitboard(p)) {
                 break;
             }
         }
@@ -574,6 +589,8 @@ Board king_legal_moves(Position pos, GameState* gs) {
 
     Board moves = king_attacks(pos, gs);
     moves &= ~gs->side[gs->turn].all_pieces;
+
+    moves &= ~(gs->side[S_WHITE].piece[P_KING] | gs->side[S_BLACK].piece[P_KING]);
 
     return moves;
 }
@@ -601,6 +618,8 @@ Board rook_legal_moves(Position pos, GameState* gs) {
         moves &= gs->side[gs->turn].check_attack_path;
     }
 
+    moves &= ~(gs->side[S_WHITE].piece[P_KING] | gs->side[S_BLACK].piece[P_KING]);
+
     return moves;
 }
 
@@ -627,6 +646,8 @@ Board bishop_legal_moves(Position pos, GameState* gs) {
         moves &= gs->side[gs->turn].check_attack_path;
     }
 
+    moves &= ~(gs->side[S_WHITE].piece[P_KING] | gs->side[S_BLACK].piece[P_KING]);
+
     return moves;
 }
 
@@ -648,6 +669,8 @@ Board queen_legal_moves(Position pos, GameState* gs) {
     if (gs->side[gs->turn].in_check) {
         moves &= gs->side[gs->turn].check_attack_path;
     }
+
+    moves &= ~(gs->side[S_WHITE].piece[P_KING] | gs->side[S_BLACK].piece[P_KING]);
 
     return moves;
 }
@@ -686,7 +709,7 @@ bool move_is_legal(GameState* gs, Move move) {
         return false;
     }
 
-    Board to = pos_id_to_bit_mask(move.data.to);
+    Board to = pos_to_bitboard(move.data.to);
     return (to & legal_moves_of_piece(gs, move.data.piece, move.data.from)) != 0;
 }
 
@@ -701,6 +724,8 @@ Board piece_attacks(GameState* gs, Piece piece, Position pos) {
         default: assert(false);
     }
 }
+
+float evaluate(GameState* gs);
 
 void print_game_state(GameState* gs, PositionList* highlights) {
     char* text_buf[64] = { 0 };
@@ -753,7 +778,7 @@ void print_game_state(GameState* gs, PositionList* highlights) {
         printf(" ");
     }
     printf("\e[0m\n  A B C D E F G H\n");
-    // printf("Evaluation: %f\n\n", evaluate(gs));
+    printf("Position static eval: %f\n\n", evaluate(gs));
 }
 
 Piece map_promo_to_piece_id(Promotion promo_id) {
@@ -772,8 +797,8 @@ Piece map_promo_to_piece_id(Promotion promo_id) {
 }
 
 void handle_pawn(GameState* gs, Move move) {
-    Board from = pos_id_to_bit_mask(move.data.from);
-    Board to = pos_id_to_bit_mask(move.data.to);
+    Board from = pos_to_bitboard(move.data.from);
+    Board to = pos_to_bitboard(move.data.to);
 
     SideId side_id = gs->turn;
     SideId op_side = !side_id;
@@ -839,8 +864,11 @@ Board get_side_attacks(GameState* gs, SideId side) {
     Board b = 0;
 
     for (Piece p = 0; p < 6; p++) {
-        // TODO: Optimise out heap alloc
-        PositionList pl = bitboard_to_position_list(gs->side[side].piece[p]);
+        PositionList pl = { 0 };
+        Position positions[64];
+        pl.positions = positions;
+
+        (void)bitboard_to_position_list(gs->side[side].piece[p], &pl);
 
         // HACK: I can't be bothered to make this good.
         SideId tmp = gs->turn;
@@ -851,8 +879,6 @@ Board get_side_attacks(GameState* gs, SideId side) {
         }
 
         gs->turn = tmp;
-
-        free(pl.positions);
     }
 
     return b;
@@ -879,11 +905,20 @@ bool move_should_be_promo(Move* move) {
 void get_all_legal_moves(GameState* gs, MoveList* out) {
     // TODO: Optimise + refactor
     for (Piece piece_type = 0; piece_type < 6; piece_type++) {
-        PositionList pl = bitboard_to_position_list(gs->side[gs->turn].piece[piece_type]);
+        PositionList pl = { 0 };
+        Position positions[64];
+        pl.positions = positions;
+
+        (void)bitboard_to_position_list(gs->side[gs->turn].piece[piece_type], &pl);
         for (Position piece_inst = 0; piece_inst < pl.length; piece_inst++) {
             Position from = pl.positions[piece_inst];
             Board legal_moves = legal_moves_of_piece(gs, piece_type, from);
-            PositionList ml = bitboard_to_position_list(legal_moves);
+
+            PositionList ml = { 0 };
+            Position moves[64];
+            ml.positions = moves;
+
+            (void)bitboard_to_position_list(legal_moves, &ml);
 
             for (int i = 0; i < ml.length; i++) {
                 Move move = { 0 };
@@ -893,7 +928,7 @@ void get_all_legal_moves(GameState* gs, MoveList* out) {
 
                 if (piece_type == P_PAWN) {
                     move.data.is_en_passant = (EN_PASSANT_MASK_LAST_GENERATED
-                        & pos_id_to_bit_mask(move.data.to)) != 0;
+                        & pos_to_bitboard(move.data.to)) != 0;
                 }
 
                 if (move_should_be_promo(&move)) {
@@ -902,11 +937,7 @@ void get_all_legal_moves(GameState* gs, MoveList* out) {
                     out->moves[out->length++] = move;
                 }
             }
-
-            free(ml.positions);
         }
-
-        free(pl.positions);
     }
 
     if (gs->side[gs->turn].can_castle_k) {
@@ -954,7 +985,7 @@ void castle(GameState* gs, Castle c) {
 
 Position pos_from_bitboard(Board b) {
     assert(set_bits_count(b) == 1);
-    return __builtin_ctzll(b);
+    return bitscan_reverse(b);
 }
 
 int sign(int n) {
@@ -970,7 +1001,11 @@ Board check_attack_path(GameState* gs, SideId s) {
     bool has_seen_one = false;
 
     for (Piece p = 0; p < 6; p++) {
-        PositionList pl = bitboard_to_position_list(gs->side[!s].piece[p]);
+        PositionList pl = { 0 };
+        Position positions[64];
+        pl.positions = positions;
+
+        (void)bitboard_to_position_list(gs->side[!s].piece[p], &pl);
 
         for (int i = 0; i < pl.length; i++) {
             Position pos = pl.positions[i];
@@ -988,7 +1023,7 @@ Board check_attack_path(GameState* gs, SideId s) {
                 }
                 has_seen_one = true;
 
-                b |= pos_id_to_bit_mask(pos);
+                b |= pos_to_bitboard(pos);
 
                 if (p == P_BISHOP || p == P_ROOK || p == P_QUEEN) {
                     Position king_pos = pos_from_bitboard(king);
@@ -1010,15 +1045,267 @@ Board check_attack_path(GameState* gs, SideId s) {
                 }
             }
         }
-
-        free(pl.positions);
     }
 
     return b;
 }
 
+static Board COLS[8];
+
+float material_eval(GameState* gs) {
+    float eval = 0;
+
+    for (Piece p = 0; p < 6; p++) {
+        int white_count = set_bits_count(gs->side[S_WHITE].piece[p]);
+        int black_count = set_bits_count(gs->side[S_BLACK].piece[p]);
+        eval += (float)(PIECE_VALUES[p] * (white_count - black_count));
+    }
+
+    return eval;
+}
+
+int set_bits_in_col(Board b, int col) {
+    return set_bits_count(b & COLS[col]);
+}
+
+Board get_pawn_attacks(Board pawns, SideId side);
+
+float evaluate_pawn_structure(GameState* gs) {
+    float eval = 0.0f;
+
+    Board white = gs->side[S_WHITE].piece[P_PAWN];
+    Board black = gs->side[S_BLACK].piece[P_PAWN];
+
+    // Pawn chains
+    for (int s = 0; s < 2; s++) {
+        float sign = s == 0 ? 1.0f : -1.0f;
+        Board pieces = gs->side[s].piece[P_PAWN];
+        Board attacks = get_pawn_attacks(pieces, s);
+        eval += sign * set_bits_count(attacks & pieces) * 0.5f;
+    }
+
+    for (int col = 0; col < 8; col++) {
+        // Doubled pawns
+        eval += (float)(set_bits_in_col(black, col) - set_bits_in_col(white, col)) * 0.5f;
+
+    }
+
+
+    return eval;
+}
+
+float evaluate_center_control(GameState* gs) {
+    float eval = 0.0f;
+
+    const Board center_four = __builtin_constant_p(sq("d4") | sq("e4") | sq("d5") | sq("e5"));
+
+    const Board outer_center = __builtin_constant_p(sq("c6") | sq("d6") | sq("e6") | sq("f6")
+        | sq("c5") | sq("f5") | sq("c4") | sq("f4")
+        | sq("c3") | sq("d3") | sq("e3") | sq("f3"));
+
+    for (int side = 0; side < 2; side++) {
+        float sign = side == 0 ? 1.0f : -1.0f;
+        int center = set_bits_count((gs->side[side].attacks
+            | gs->side[side].all_pieces) & center_four);
+        int outer_center = set_bits_count((gs->side[side].attacks
+            | gs->side[side].all_pieces) & outer_center);
+
+        eval += sign * ((float)center * 0.2f + (float)outer_center * 0.05f);
+    }
+
+    return eval;
+}
+
+float evaluate_king_safety(GameState* gs);
+
+float evaluate(GameState* gs) {
+    switch (gs->game_result) {
+        case R_WHITE_WON: return INFINITY;
+        case R_BLACK_WON: return -INFINITY;
+        case R_DRAW: return 0;
+        default: break;
+    }
+
+    float checks = -gs->side[S_WHITE].in_check + gs->side[S_BLACK].in_check;
+
+    float castle_rights = gs->side[S_WHITE].can_castle_k + gs->side[S_WHITE].can_castle_q
+        - (gs->side[S_BLACK].can_castle_k + gs->side[S_BLACK].can_castle_q);
+
+    return material_eval(gs) * 1.5
+        + castle_rights * 0.4
+        + checks * 1.2
+        + evaluate_pawn_structure(gs) * 0.4
+        + evaluate_center_control(gs) * 0.9
+        + evaluate_king_safety(gs) * 0.6;
+}
+
+bool drawn_by_repetition(GameState* gs) {
+    int count = 0;
+    u64 current_board_hash = hash_position(gs);
+    for (int i = 0; i < gs->seen_position_hashes_count; i++) {
+        if (current_board_hash == gs->seen_position_hashes[i]) {
+            if (++count >= 3) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    Piece piece;
+    SideId side;
+} PieceAndCol;
+
+PieceAndCol piece_from_FEN(char c) {
+    SideId s = isupper(c) ? S_WHITE : S_BLACK;
+    c = tolower(c);
+    switch (c) {
+        case 'p': return (PieceAndCol){ P_PAWN, s };
+        case 'n': return (PieceAndCol){ P_KNIGHT, s };
+        case 'b': return (PieceAndCol){ P_BISHOP, s };
+        case 'r': return (PieceAndCol){ P_ROOK, s };
+        case 'q': return (PieceAndCol){ P_QUEEN, s };
+        case 'k': return (PieceAndCol){ P_KING, s };
+        default: return (PieceAndCol){ -1, -1 };
+    }
+}
+
+GameState parse_FEN(char* fen) {
+    GameState gs = { 0 };
+    char* error_msg = NULL;
+
+    int cursor = 0;
+    for (int row = 7; row >= 0; row--){
+        for (int col = 0; col < 8; col++) {
+            char c = fen[cursor++];
+            PieceAndCol p = piece_from_FEN(c);
+            if (p.piece != -1) {
+                // Was letter. Add piece to board.
+                gs.side[p.side].piece[p.piece] |=
+                    pos_to_bitboard(pos_from_row_and_col(row, col));
+            } else if (isdigit(c)) {
+                col += c - '0' - 1;
+                if (col >= 8) {
+                    char* msg_template = "invalid number '%c'. row too long";
+                    error_msg = malloc(strlen(msg_template) + 1);
+                    sprintf(error_msg, msg_template, c);
+                    goto err;
+                }
+            } else {
+                char* msg_template = "invalid character '%c'";
+                error_msg = malloc(strlen(msg_template) + 1);
+                sprintf(error_msg, msg_template, c);
+                goto err;
+            }
+        }
+
+        if (row != 0 && fen[cursor++] != '/') {
+            error_msg = "row not terminated by '/'";
+            goto err;
+        }
+    }
+
+    #define CHECK_SPACE if (fen[cursor++] != ' ') { \
+        error_msg = "expected space"; \
+        goto err; \
+    } \
+
+    CHECK_SPACE
+
+    switch (fen[cursor++]) {
+        case 'w': gs.turn = S_WHITE; break;
+        case 'b': gs.turn = S_BLACK; break;
+        default:
+            error_msg = "invalid turn. expected 'w' or 'b'";
+            goto err;
+    }
+
+    CHECK_SPACE
+
+    gs.side[S_WHITE].rook_k_moved = true;
+    gs.side[S_WHITE].rook_q_moved = true;
+    gs.side[S_BLACK].rook_k_moved = true;
+    gs.side[S_BLACK].rook_q_moved = true;
+
+    if (fen[cursor] == '-') {
+        cursor++;
+    } else {
+        for (int i = 0; i < 4; i++) {
+            char c = fen[cursor++];
+
+            if (c == ' ') {
+                cursor--;
+                break;
+            }
+
+            switch (c) {
+                case 'K': gs.side[S_WHITE].rook_k_moved = false;
+                case 'Q': gs.side[S_WHITE].rook_k_moved = false;
+                case 'k': gs.side[S_BLACK].rook_k_moved = false;
+                case 'q': gs.side[S_BLACK].rook_k_moved = false;
+            }
+        }
+    }
+
+    CHECK_SPACE
+
+    char en_passant[3] = { 0 };
+    for (int i = 0; i < 2; i++) {
+        char c = fen[cursor++];
+        if (c == ' ') {
+            cursor--;
+            break;
+        }
+        en_passant[i] = c;
+    }
+
+    if (en_passant[0] != '-') {
+        if (!isalpha(en_passant[0])
+        || !isdigit(en_passant[1])
+        || en_passant[2] != 0) {
+
+            char* msg_template = "invalid en passant position '%s'. expected 'a'-'h' followed by '1'-'8'";
+            error_msg = malloc(strlen(msg_template) + 2);
+            sprintf(error_msg, msg_template, en_passant);
+            goto err;
+        } else {
+            Position pos = notation_to_pos(en_passant);
+
+            // We handle en passant by storing the position of the pawn that
+            // can be captured which is different from the position in the FEN
+            // which is that which the capturing pawn moves to. Thus we just
+            // find the row ourselves and use only the column from the FEN.
+            int col = col_from_pos(pos);
+            int row = gs.turn == S_WHITE ? 4 : 3;
+
+            int row_from_FEN = row_from_pos(pos);
+            if (row_from_FEN != (gs.turn == S_WHITE ? 5 : 2)) {
+                char* msg_template = "invalid en passant position '%s'";
+                error_msg = malloc(strlen(msg_template) + 2);
+                sprintf(error_msg, msg_template, en_passant);
+                goto err;
+            }
+
+            gs.en_passant = pos_to_bitboard(pos_from_row_and_col(row, col));
+        }
+    }
+
+    // Halfmove clock and fullmove counter would be parsed here
+    // but they are not needed.
+
+    err:
+    if (error_msg != NULL) {
+        printf("Invalid FEN: %s.\n", error_msg);
+        exit(1);
+    }
+
+    return gs;
+}
+
 void apply_move(GameState* gs, Move move) {
-    // assert(move_is_legal(gs, move));
+    assert(move_is_legal(gs, move));
+    assert(gs->game_result == R_PLAYING);
 
     gs->en_passant = 0;
 
@@ -1026,10 +1313,11 @@ void apply_move(GameState* gs, Move move) {
 
     if (move.data.castle != CASTLE_NONE) {
         castle(gs, move.data.castle);
+        gs->side[gs->turn].did_castle = true;
     } else {
         // TODO: refactor this into a function
-        Board from = pos_id_to_bit_mask(move.data.from);
-        Board to = pos_id_to_bit_mask(move.data.to);
+        Board from = pos_to_bitboard(move.data.from);
+        Board to = pos_to_bitboard(move.data.to);
 
         SideId side_id = gs->turn;
         SideId op_side = !side_id;
@@ -1058,11 +1346,11 @@ void apply_move(GameState* gs, Move move) {
         gs->side[gs->turn].king_moved = true;
     } else if (piece == P_ROOK) {
         Board k_side = gs->turn == S_WHITE
-            ? translate_notation_to_pos("h1")
-            : translate_notation_to_pos("h8");
+            ? notation_to_pos("h1")
+            : notation_to_pos("h8");
         Board q_side = gs->turn == S_WHITE
-            ? translate_notation_to_pos("a1")
-            : translate_notation_to_pos("a8");
+            ? notation_to_pos("a1")
+            : notation_to_pos("a8");
 
         if (!gs->side[gs->turn].rook_k_moved
             && move.data.from == k_side) {
@@ -1103,12 +1391,39 @@ void apply_move(GameState* gs, Move move) {
         }
     }
 
+    gs->seen_position_hashes[gs->seen_position_hashes_count++]
+        = hash_position(gs);
+
+    if (drawn_by_repetition(gs)) {
+        gs->game_result = R_DRAW;
+    }
+
     gs->turn = !gs->turn;
+
+    if (gs->side[gs->turn].in_check) {
+        // Checkmate
+        MoveList ml = { 0 };
+        Move moves[128];
+        ml.moves = moves;
+
+        get_all_legal_moves(gs, &ml);
+
+        if (ml.length == 0) {
+            gs->game_result = gs->turn == S_WHITE ? R_BLACK_WON : R_WHITE_WON;
+        }
+    }
+}
+
+void generate_cols() {
+    for (int i = 0; i < 8; i++) {
+        COLS[i] = 0x0101010101010101 << i;
+    }
 }
 
 void generate_LUTs() {
     generate_knight_LUT();
     generate_king_LUT();
+    generate_cols();
 }
 
 void set_up_board(GameState* gs) {
@@ -1127,8 +1442,101 @@ void set_up_board(GameState* gs) {
     gs->side[S_BLACK].piece[P_PAWN] |= 0x00FF000000000000;
 }
 
-EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta) {
-    if (depth == 0) {
+Board get_pawn_attacks(Board pawns, SideId side) {
+    Board attacks = 0;
+
+    PositionList pl = { 0 };
+    Position positions[64];
+    pl.positions = positions;
+
+    GameState gs = { 0 };
+    gs.side[side].piece[P_PAWN] = pawns;
+    gs.turn = side;
+
+    (void)bitboard_to_position_list(pawns, &pl);
+
+    for (int i = 0; i < pl.length; i++) {
+        Position pos = pl.positions[i];
+
+        attacks |= pawn_attacks(pos, &gs);
+    }
+
+    return attacks;
+}
+
+float evaluate_king_safety(GameState* gs) {
+    float eval = 0.0f;
+
+    Board king_w = gs->side[S_WHITE].piece[P_KING];
+    Board king_b = gs->side[S_BLACK].piece[P_KING];
+
+
+    for (int side = 0; side < 2; side++) {
+        float sign = side == S_WHITE ? 1.0f : -1.0f;
+
+        if (gs->side[side].did_castle) {
+            eval += sign * 0.5f;
+
+            Position king_pos = pos_from_bitboard(king_w);
+            Board pawns = gs->side[side].piece[P_PAWN];
+            int pawn_shield = set_bits_count(pawns & KING_MOVES_LUT[king_pos]);
+            eval += sign * pawn_shield * 0.6f;
+        }
+    }
+
+    return eval;
+}
+
+typedef struct {
+    u64 hash;
+    EvaluatedMove move;
+    int depth;
+} TranspositionTableEntry;
+
+typedef struct {
+    TranspositionTableEntry* data;
+    u64 capacity;
+} TranspositionTable;
+
+TranspositionTable new_tt(u64 capacity) {
+    TranspositionTableEntry* data =
+        malloc(sizeof(TranspositionTableEntry) * capacity);
+    TranspositionTable tt = { data, capacity };
+    return tt;
+}
+
+TranspositionTableEntry query_tt(TranspositionTable* tt, GameState* gs) {
+    u64 hash = hash_position(gs);
+    TranspositionTableEntry search_result = tt->data[hash % tt->capacity];
+
+    if (search_result.hash == hash) {
+        return search_result;
+    } else {
+        TranspositionTableEntry te = { 0 };
+        return te;
+    }
+}
+
+void insert_into_tt(TranspositionTable* tt, GameState* gs, EvaluatedMove em, int depth) {
+    u64 hash = hash_position(gs);
+
+    // Depth-Preferred
+    TranspositionTableEntry existing = tt->data[hash % tt->capacity];
+    if (existing.hash == hash && existing.depth > depth) {
+        return;
+    }
+
+    TranspositionTableEntry entry = { hash, em, depth };
+
+    tt->data[hash % tt->capacity] = entry;
+}
+
+bool is_null_move(Move* m) {
+    return m->data.from == 0 && m->data.to == 0;
+}
+
+EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta, TranspositionTable* tt) {
+    if (depth == 0 || gs->game_result != R_PLAYING) {
         Move mv = { 0 };
         float eval = evaluate(gs);
         EvaluatedMove em = { mv, eval };
@@ -1136,7 +1544,7 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta) {
     }
 
     MoveList ml = { 0 };
-    Move moves[128];
+    Move moves[256];
     ml.moves = moves;
 
     get_all_legal_moves(gs, &ml);
@@ -1149,7 +1557,16 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta) {
     for (int i = 0; i < ml.length; i++) {
         GameState new_gs = *gs;
         apply_move(&new_gs, ml.moves[i]);
-        EvaluatedMove em = minimax(depth - 1, &new_gs, alpha, beta);
+
+        EvaluatedMove em;
+
+        TranspositionTableEntry em_from_tt = query_tt(tt, &new_gs);
+
+        if (!is_null_move(&em_from_tt.move.move) && em_from_tt.depth >= depth - 1) {
+            em = em_from_tt.move;
+        } else {
+            em = minimax(depth - 1, &new_gs, alpha, beta, tt);
+        }
 
         bool move_is_better = max
             ? em.eval > best_move.eval
@@ -1174,6 +1591,8 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta) {
 
     }
 
+    insert_into_tt(tt, gs, best_move, depth);
+
     return best_move;
 }
 
@@ -1186,9 +1605,21 @@ int main(int argc, char* argv[]) {
 
     (void)update_all_piece_stores(&gs);
 
-    #define move(m) apply_move(&gs, translate_notation_to_move(m, &gs))
+    TranspositionTable tt = new_tt(1e8);
+    printf("TT capacity: %fGiB\n", (float)(tt.capacity * sizeof(TranspositionTableEntry)) / (float)(1024 * 1024 * 1024));
 
-    move("e2e4");
+    #define move(m) apply_move(&gs, notation_to_move(m, &gs))
+
+    // FIXME: This causes a segfault when you try to calculate the next move.
+    // gs = parse_FEN("Knnnkbnn/pppppnpp/n1nnnnnn/nqnnrQnn/nnbNPpnn/nnnnnnPn/PPPPnPnP/RNB2B1R b A e3 0 1");
+
+    // move("e2e4");
+    // move("e7e6");
+    // move("d2d4");
+    // move("d7d6");
+    // move("b1c3");
+    // move("e8e7");
+    // gs.turn = S_WHITE;
 
     print_game_state(&gs, NULL);
 
@@ -1196,7 +1627,7 @@ int main(int argc, char* argv[]) {
         printf("%s to move.\n", gs.turn == S_WHITE ? "White" : "Black");
         printf("Thinking...\n");
 
-        EvaluatedMove em = minimax(5, &gs, -INFINITY, INFINITY);
+        EvaluatedMove em = minimax(6, &gs, -INFINITY, INFINITY, &tt);
 
         PositionList pl = { 0 };
         Position positions[2] = { em.move.data.from, em.move.data.to };
@@ -1221,7 +1652,7 @@ int main(int argc, char* argv[]) {
         }
 
         char move_notation[12];
-        translate_move_to_notation(em.move, move_notation);
+        move_to_notation(em.move, move_notation);
         printf("Playing move: %s\n", move_notation);
         printf("Eval: %f\n", em.eval);
         // printf("B_K_CASTLE: %d\n", gs.side[S_BLACK].can_castle_k);
@@ -1231,8 +1662,12 @@ int main(int argc, char* argv[]) {
 
 
         apply_move(&gs, em.move);
-
         print_game_state(&gs, &pl);
+
+        if (gs.game_result != R_PLAYING) {
+            printf("Final Eval: %f\n", evaluate(&gs));
+            break;
+        }
     }
 
     return 0;
