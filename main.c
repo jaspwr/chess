@@ -14,6 +14,11 @@ typedef unsigned char u8;
 typedef u64 Board;
 typedef u8 Position;
 
+#define ENGINE_NAME "goat"
+#define ENGINE_AUTHOR "jasper"
+
+Position pos_from_bitboard(Board b);
+
 typedef enum {
     S_WHITE,
     S_BLACK,
@@ -28,9 +33,8 @@ typedef struct {
     Board check_attack_path;
     bool can_castle_k;
     bool can_castle_q;
-    bool king_moved;
-    bool rook_k_moved;
-    bool rook_q_moved;
+    bool lost_k_castle_rights;
+    bool lost_q_castle_rights;
     bool did_castle;
 } Side;
 
@@ -128,13 +132,11 @@ u64 hash_position(GameState* gs) {
     }
 
     hash += gs->turn;
-    hash ^= gs->en_passant * 111UL;
-    hash ^= gs->side[S_WHITE].king_moved * 222UL;
-    hash ^= gs->side[S_WHITE].rook_k_moved * 333UL;
-    hash ^= gs->side[S_WHITE].rook_q_moved * 444UL;
-    hash ^= gs->side[S_BLACK].king_moved * 555UL;
-    hash ^= gs->side[S_BLACK].rook_k_moved* 666UL;
-    hash ^= gs->side[S_BLACK].rook_q_moved * 777UL;
+    hash ^= gs->en_passant * 0xdecafbadUL;
+    hash ^= gs->side[S_WHITE].lost_k_castle_rights * 222UL;
+    hash ^= gs->side[S_WHITE].lost_q_castle_rights * 444UL;
+    hash ^= gs->side[S_BLACK].lost_k_castle_rights * 666UL;
+    hash ^= gs->side[S_BLACK].lost_q_castle_rights * 777UL;
 
     return hash;
 }
@@ -224,13 +226,26 @@ char promotion_to_notation(Promotion promo) {
     }
 }
 
-void move_to_notation(Move move, char* buf) {
+void move_to_notation(Move move, char* buf, SideId side) {
+    // if (move.data.castle != CASTLE_NONE) {
+    //     if (move.data.castle == CASTLE_K) {
+    //         (void)memcpy(buf, "O-O", 4);
+    //     } else if (move.data.castle == CASTLE_Q) {
+    //         (void)memcpy(buf, "O-O-O", 6);
+    //     }
+
+    //     return;
+    // }
+
     if (move.data.castle != CASTLE_NONE) {
+        char* castle;
         if (move.data.castle == CASTLE_K) {
-            (void)memcpy(buf, "O-O", 4);
+            castle = side == S_WHITE ? "e1g1" : "e8g8";
         } else if (move.data.castle == CASTLE_Q) {
-            (void)memcpy(buf, "O-O-O", 6);
+            castle = side == S_WHITE ? "e1c1" : "e8c8";
         }
+
+        (void)memcpy(buf, castle, 5);
 
         return;
     }
@@ -264,14 +279,14 @@ Piece piece_at(Position pos, GameState* gs) {
 Move notation_to_move(char* buf, GameState* gs) {
     Move move = { 0 };
 
-    if (strcmp(buf, "O-O-O") == 0) {
-        move.data.castle = CASTLE_Q;
-        return move;
-    }
-    if (strcmp(buf, "O-O") == 0) {
-        move.data.castle = CASTLE_K;
-        return move;
-    }
+    // if (strcmp(buf, "O-O-O") == 0) {
+    //     move.data.castle = CASTLE_Q;
+    //     return move;
+    // }
+    // if (strcmp(buf, "O-O") == 0) {
+    //     move.data.castle = CASTLE_K;
+    //     return move;
+    // }
 
     move.data.from = notation_to_pos(buf);
     move.data.to = notation_to_pos(buf + 2);
@@ -296,6 +311,22 @@ Move notation_to_move(char* buf, GameState* gs) {
     }
 
     move.data.piece = piece_at(move.data.from, gs);
+
+    if (move.data.piece == P_KING) {
+        if (move.data.from == notation_to_pos("e1")) {
+            if (move.data.to == notation_to_pos("g1")) {
+                move.data.castle = CASTLE_K;
+            } else if (move.data.to == notation_to_pos("c1")) {
+                move.data.castle = CASTLE_Q;
+            }
+        } else if (move.data.from == notation_to_pos("e8")) {
+            if (move.data.to == notation_to_pos("g8")) {
+                move.data.castle = CASTLE_K;
+            } else if (move.data.to == notation_to_pos("c8")) {
+                move.data.castle = CASTLE_Q;
+            }
+        }
+    }
 
     return move;
 }
@@ -542,6 +573,11 @@ Board king_attacks(Position pos, GameState* gs) {
 
     Board moves = KING_MOVES_LUT[pos];
     moves &= ~gs->side[!gs->turn].attacks;
+
+    // HACK: The king's attacked squares weren't in the attack bitboard.
+    //       Probably should be addressed properly.
+    Position op_king_pos = pos_from_bitboard(gs->side[!gs->turn].piece[P_KING]);
+    moves &= ~KING_MOVES_LUT[op_king_pos];
 
     return moves;
 }
@@ -902,6 +938,82 @@ bool move_should_be_promo(Move* move) {
     return move->data.piece == P_PAWN && (row == 0 || row == 7);
 }
 
+void check_if_piece_pins(GameState* gs, Board* pins,
+    Position blocker_pos, Position p, int dir) {
+
+    Piece piece_type = piece_at(p, gs);
+
+    switch (piece_type) {
+        case P_ROOK: {
+            if ((dir + 1) % 2 == 0) {
+                *pins |= pos_to_bitboard(blocker_pos);
+            }
+            break;
+        }
+        case P_BISHOP: {
+            if (dir % 2 == 0) {
+                *pins |= pos_to_bitboard(blocker_pos);
+            }
+            break;
+        }
+        case P_QUEEN: {
+            *pins |= pos_to_bitboard(blocker_pos);
+            break;
+        }
+        default: break;
+    }
+}
+
+Board get_pins(GameState* gs, SideId side) {
+    Position king_pos = pos_from_bitboard(gs->side[side].piece[P_KING]);
+    int king_row = row_from_pos(king_pos);
+    int king_col = col_from_pos(king_pos);
+
+    PosOffset dirs[8] = {
+        { 1, 1 },
+        { 1, 0 },
+        { 1, -1 },
+        { 0, -1 },
+        { -1, -1 },
+        { -1, 0 },
+        { -1, 1 },
+        { 0, 1 },
+    };
+
+    Board pins = 0;
+
+    for (int dir = 0; dir < 8; dir++) {
+        Position blocker_pos = 65;
+        for (int dist = 1; true; dist++) {
+            int row = king_row + dirs[dir].y * dist;
+            int col = king_col + dirs[dir].x * dist;
+            if (row < 0 || row > 7 || col < 0 || col > 7) {
+                break;
+            }
+
+            Position p = pos_from_row_and_col(row, col);
+
+            Board mask = pos_to_bitboard(p);
+
+            if ((gs->side[side].all_pieces & mask) != 0) {
+                if (blocker_pos == 65) {
+                    blocker_pos = p;
+                    continue;
+                } else {
+                    break;
+                }
+            } else if ((gs->side[!side].all_pieces & mask) != 0) {
+                if (blocker_pos != 65) {
+                    check_if_piece_pins(gs, &pins, blocker_pos, p, dir);
+                }
+                break;
+            }
+        }
+    }
+
+    return pins;
+}
+
 void get_all_legal_moves(GameState* gs, MoveList* out) {
     // TODO: Optimise + refactor
     for (Piece piece_type = 0; piece_type < 6; piece_type++) {
@@ -965,7 +1077,6 @@ void castle(GameState* gs, Castle c) {
             gs->side[gs->turn].piece[P_ROOK] |= sq("f8");
         }
 
-        gs->side[gs->turn].rook_k_moved = true;
     } else if (c == CASTLE_Q) {
         if (gs->turn == S_WHITE) {
             gs->side[gs->turn].piece[P_KING] = sq("c1");
@@ -977,10 +1088,10 @@ void castle(GameState* gs, Castle c) {
             gs->side[gs->turn].piece[P_ROOK] |= sq("d8");
         }
 
-        gs->side[gs->turn].rook_k_moved = true;
     }
 
-    gs->side[gs->turn].king_moved = true;
+    gs->side[gs->turn].lost_q_castle_rights = true;
+    gs->side[gs->turn].lost_k_castle_rights = true;
 }
 
 Position pos_from_bitboard(Board b) {
@@ -992,6 +1103,13 @@ int sign(int n) {
     if (n < 0) return -1;
     if (n > 0) return 1;
     return 0;
+}
+
+PosOffset direction(Position pos1, Position pos2) {
+    int delta_row = row_from_pos(pos2) - row_from_pos(pos1);
+    int delta_col = col_from_pos(pos2) - col_from_pos(pos1);
+
+    return (PosOffset) { sign(delta_row), sign(delta_col) };
 }
 
 Board check_attack_path(GameState* gs, SideId s) {
@@ -1027,19 +1145,8 @@ Board check_attack_path(GameState* gs, SideId s) {
 
                 if (p == P_BISHOP || p == P_ROOK || p == P_QUEEN) {
                     Position king_pos = pos_from_bitboard(king);
-                    int king_row = row_from_pos(king_pos);
-                    int king_col = col_from_pos(king_pos);
 
-                    int att_row = row_from_pos(pos);
-                    int att_col = col_from_pos(pos);
-
-                    int delta_row = att_row - king_row;
-                    int delta_col = att_col - king_col;
-
-                    int row_s = sign(delta_row);
-                    int col_s = sign(delta_col);
-
-                    const PosOffset offsets[1] = { { row_s, col_s } };
+                    const PosOffset offsets[1] = { direction(king_pos, pos) };
 
                     b |= sliding_piece_attacks(king_pos, gs, offsets, 1);
                 }
@@ -1097,11 +1204,11 @@ float evaluate_pawn_structure(GameState* gs) {
 float evaluate_center_control(GameState* gs) {
     float eval = 0.0f;
 
-    const Board center_four = __builtin_constant_p(sq("d4") | sq("e4") | sq("d5") | sq("e5"));
+    const Board center_four = sq("d4") | sq("e4") | sq("d5") | sq("e5");
 
-    const Board outer_center = __builtin_constant_p(sq("c6") | sq("d6") | sq("e6") | sq("f6")
+    const Board outer_center = sq("c6") | sq("d6") | sq("e6") | sq("f6")
         | sq("c5") | sq("f5") | sq("c4") | sq("f4")
-        | sq("c3") | sq("d3") | sq("e3") | sq("f3"));
+        | sq("c3") | sq("d3") | sq("e3") | sq("f3");
 
     for (int side = 0; side < 2; side++) {
         float sign = side == 0 ? 1.0f : -1.0f;
@@ -1131,9 +1238,13 @@ float evaluate(GameState* gs) {
     float castle_rights = gs->side[S_WHITE].can_castle_k + gs->side[S_WHITE].can_castle_q
         - (gs->side[S_BLACK].can_castle_k + gs->side[S_BLACK].can_castle_q);
 
+    float pins = set_bits_count(gs->side[S_BLACK].pinned_pieces)
+        - set_bits_count(gs->side[S_WHITE].pinned_pieces);
+
     return material_eval(gs) * 1.5
         + castle_rights * 0.4
         + checks * 1.2
+        + pins * 0.9
         + evaluate_pawn_structure(gs) * 0.4
         + evaluate_center_control(gs) * 0.9
         + evaluate_king_safety(gs) * 0.6;
@@ -1223,10 +1334,10 @@ GameState parse_FEN(char* fen) {
 
     CHECK_SPACE
 
-    gs.side[S_WHITE].rook_k_moved = true;
-    gs.side[S_WHITE].rook_q_moved = true;
-    gs.side[S_BLACK].rook_k_moved = true;
-    gs.side[S_BLACK].rook_q_moved = true;
+    gs.side[S_WHITE].lost_k_castle_rights = true;
+    gs.side[S_WHITE].lost_q_castle_rights = true;
+    gs.side[S_BLACK].lost_k_castle_rights = true;
+    gs.side[S_BLACK].lost_q_castle_rights = true;
 
     if (fen[cursor] == '-') {
         cursor++;
@@ -1240,10 +1351,10 @@ GameState parse_FEN(char* fen) {
             }
 
             switch (c) {
-                case 'K': gs.side[S_WHITE].rook_k_moved = false;
-                case 'Q': gs.side[S_WHITE].rook_k_moved = false;
-                case 'k': gs.side[S_BLACK].rook_k_moved = false;
-                case 'q': gs.side[S_BLACK].rook_k_moved = false;
+                case 'K': gs.side[S_WHITE].lost_k_castle_rights = false;
+                case 'Q': gs.side[S_WHITE].lost_q_castle_rights = false;
+                case 'k': gs.side[S_BLACK].lost_k_castle_rights = false;
+                case 'q': gs.side[S_BLACK].lost_q_castle_rights = false;
             }
         }
     }
@@ -1342,8 +1453,29 @@ void apply_move(GameState* gs, Move move) {
     update_all_piece_stores(gs);
     // Board update complete.
 
+    // Revoke opponents castling rights if we just moved to
+    // either of their rook's starting positions.
+    if (!gs->side[!gs->turn].lost_k_castle_rights) {
+        Board k_side = gs->turn != S_WHITE
+            ? notation_to_pos("h1")
+            : notation_to_pos("h8");
+        if (move.data.to == k_side) {
+            gs->side[!gs->turn].lost_k_castle_rights = true;
+        }
+    }
+
+    if (!gs->side[!gs->turn].lost_q_castle_rights) {
+        Board q_side = gs->turn != S_WHITE
+            ? notation_to_pos("a1")
+            : notation_to_pos("a8");
+        if (move.data.to == q_side) {
+            gs->side[!gs->turn].lost_q_castle_rights = true;
+        }
+    }
+
     if (piece == P_KING) {
-        gs->side[gs->turn].king_moved = true;
+        gs->side[gs->turn].lost_k_castle_rights = true;
+        gs->side[gs->turn].lost_q_castle_rights = true;
     } else if (piece == P_ROOK) {
         Board k_side = gs->turn == S_WHITE
             ? notation_to_pos("h1")
@@ -1352,12 +1484,10 @@ void apply_move(GameState* gs, Move move) {
             ? notation_to_pos("a1")
             : notation_to_pos("a8");
 
-        if (!gs->side[gs->turn].rook_k_moved
-            && move.data.from == k_side) {
-            gs->side[gs->turn].rook_k_moved = true;
-        } else if (!gs->side[gs->turn].rook_q_moved
-            && move.data.from == q_side) {
-            gs->side[gs->turn].rook_q_moved = true;
+        if (move.data.from == k_side) {
+            gs->side[gs->turn].lost_k_castle_rights = true;
+        } else if (move.data.from == q_side) {
+            gs->side[gs->turn].lost_q_castle_rights = true;
         }
     }
 
@@ -1380,14 +1510,17 @@ void apply_move(GameState* gs, Move move) {
             Board k_side_mask = s == S_WHITE ? W_CASTLE_MASK_K : B_CASTLE_MASK_K;
 
             bool clear_k = (k_side_mask & (gs->all_pieces | gs->side[!s].attacks)) == 0;
+
             gs->side[s].can_castle_k = clear_k
-                && !gs->side[s].rook_k_moved
-                && !gs->side[s].king_moved;
+                && !gs->side[s].lost_k_castle_rights;
 
             bool clear_q = (q_side_mask & (gs->all_pieces | gs->side[!s].attacks)) == 0;
+
             gs->side[s].can_castle_q = clear_q
-                && !gs->side[s].rook_q_moved
-                && !gs->side[s].king_moved;
+                && !gs->side[s].lost_q_castle_rights;
+        } else {
+            gs->side[s].can_castle_k = false;
+            gs->side[s].can_castle_q = false;
         }
     }
 
@@ -1397,6 +1530,9 @@ void apply_move(GameState* gs, Move move) {
     if (drawn_by_repetition(gs)) {
         gs->game_result = R_DRAW;
     }
+
+    gs->side[S_WHITE].pinned_pieces = get_pins(gs, S_WHITE);
+    gs->side[S_BLACK].pinned_pieces = get_pins(gs, S_BLACK);
 
     gs->turn = !gs->turn;
 
@@ -1427,19 +1563,19 @@ void generate_LUTs() {
 }
 
 void set_up_board(GameState* gs) {
-    gs->side[S_WHITE].piece[P_KNIGHT] |= 0x42;
-    gs->side[S_WHITE].piece[P_BISHOP] |= 0x24;
-    gs->side[S_WHITE].piece[P_ROOK] |= 0x81;
-    gs->side[S_WHITE].piece[P_QUEEN] |= 0x08;
-    gs->side[S_WHITE].piece[P_KING] |= 0x10;
-    gs->side[S_WHITE].piece[P_PAWN] |= 0xFF00;
+    gs->side[S_WHITE].piece[P_KNIGHT] = 0x42;
+    gs->side[S_WHITE].piece[P_BISHOP] = 0x24;
+    gs->side[S_WHITE].piece[P_ROOK] = 0x81;
+    gs->side[S_WHITE].piece[P_QUEEN] = 0x08;
+    gs->side[S_WHITE].piece[P_KING] = 0x10;
+    gs->side[S_WHITE].piece[P_PAWN] = 0xFF00;
 
-    gs->side[S_BLACK].piece[P_KNIGHT] |= 0x4200000000000000;
-    gs->side[S_BLACK].piece[P_BISHOP] |= 0x2400000000000000;
-    gs->side[S_BLACK].piece[P_ROOK] |= 0x8100000000000000;
-    gs->side[S_BLACK].piece[P_QUEEN] |= 0x0800000000000000;
-    gs->side[S_BLACK].piece[P_KING] |= 0x1000000000000000;
-    gs->side[S_BLACK].piece[P_PAWN] |= 0x00FF000000000000;
+    gs->side[S_BLACK].piece[P_KNIGHT] = 0x4200000000000000;
+    gs->side[S_BLACK].piece[P_BISHOP] = 0x2400000000000000;
+    gs->side[S_BLACK].piece[P_ROOK] = 0x8100000000000000;
+    gs->side[S_BLACK].piece[P_QUEEN] = 0x0800000000000000;
+    gs->side[S_BLACK].piece[P_KING] = 0x1000000000000000;
+    gs->side[S_BLACK].piece[P_PAWN] = 0x00FF000000000000;
 }
 
 Board get_pawn_attacks(Board pawns, SideId side) {
@@ -1469,7 +1605,6 @@ float evaluate_king_safety(GameState* gs) {
 
     Board king_w = gs->side[S_WHITE].piece[P_KING];
     Board king_b = gs->side[S_BLACK].piece[P_KING];
-
 
     for (int side = 0; side < 2; side++) {
         float sign = side == S_WHITE ? 1.0f : -1.0f;
@@ -1596,6 +1731,146 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta, Transpo
     return best_move;
 }
 
+EvaluatedMove engine_move(GameState* gs, TranspositionTable* tt) {
+    EvaluatedMove em = minimax(6, gs, -INFINITY, INFINITY, tt);
+
+    if (em.eval == INFINITY || em.eval == -INFINITY) {
+        // printf("%s has forced mate!\n", em.eval > 0 ? "White" : "Black");
+
+        MoveList ml = { 0 };
+        Move moves[128];
+        ml.moves = moves;
+        get_all_legal_moves(gs, &ml);
+        if (ml.length == 0) {
+            // printf("Stalemate!\n");
+            return (EvaluatedMove) { 0 };
+        }
+        em.move = ml.moves[0];
+    }
+
+    apply_move(gs, em.move);
+    return em;
+}
+
+void reset_game(GameState* gs) {
+    memset(gs, 0, sizeof(GameState));
+}
+
+void play_self_loop(GameState* gs, TranspositionTable* tt) {
+    for (int move = 0; true; move++) {
+        printf("%s to move.\n", gs->turn == S_WHITE ? "White" : "Black");
+        printf("Thinking...\n");
+
+        SideId side_to_move = gs->turn;
+        EvaluatedMove em = engine_move(gs, tt);
+
+        char move_notation[12];
+        move_to_notation(em.move, move_notation, side_to_move);
+
+        printf("Playing move: %s\n", move_notation);
+        printf("Eval: %f\n", em.eval);
+
+        PositionList pl = { 0 };
+        Position positions[2] = { em.move.data.from, em.move.data.to };
+        pl.positions = positions;
+        pl.length = 2;
+
+        print_game_state(gs, &pl);
+
+        if (gs->game_result != R_PLAYING) {
+            printf("Final Eval: %f\n", evaluate(gs));
+            break;
+        }
+
+    }
+}
+
+void apply_move_list(char* str, GameState* gs) {
+    char move_buf[10] = { 0 };
+    int move_buf_len = 0;
+    while (*(++str) != 0) {
+        if (isalnum(*str)) {
+            move_buf[move_buf_len++] = *str;
+        } else if (*str == ' ' || *str == '\n') {
+            if (move_buf_len == 0) continue;
+
+            move_buf[move_buf_len] = 0;
+
+            printf("move: %s\n", move_buf);
+
+            GameState tmp_gs = *gs;
+
+            Move move = notation_to_move(move_buf, &tmp_gs);
+            apply_move(gs, move);
+
+            move_buf_len = 0;
+        } else {
+            assert(false);
+        }
+    }
+}
+
+void UCI_loop(GameState* gs, TranspositionTable* tt) {
+    char line[2048];
+    while (true) {
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            continue;
+        }
+        if (strncmp(line, "ucinewgame", 10) == 0) {
+            (void)reset_game(gs);
+            (void)set_up_board(gs);
+            (void)update_all_piece_stores(gs);
+        } else if (strncmp(line, "uci", 3) == 0) {
+            printf("id name %s\n", ENGINE_NAME);
+            printf("id author %s\n", ENGINE_AUTHOR);
+            printf("uciok\n");
+        } else if (strncmp(line, "isready", 7) == 0) {
+            printf("readyok\n");
+        } else if ((strncmp(line, "stop", 4) == 0) || (strncmp(line, "quit", 4) == 0)) {
+            // break;
+        } else if (strncmp(line, "position", 8) == 0) {
+            char* pos = line + 9;
+            if (strncmp(pos, "startpos", 8) == 0) {
+                (void)reset_game(gs);
+                (void)set_up_board(gs);
+                (void)update_all_piece_stores(gs);
+                pos += 9;
+            } else if (strncmp(pos, "fen", 3) == 0) {
+                pos += 4;
+                *gs = parse_FEN(pos);
+            }
+
+            if (strncmp(pos, "moves", 5) == 0) {
+                pos += 5;
+
+                (void)apply_move_list(pos, gs);
+            }
+        } else if (strncmp(line, "go", 2) == 0) {
+            SideId side_to_move = gs->turn;
+            EvaluatedMove em = engine_move(gs, tt);
+
+            char move_notation[12];
+            move_to_notation(em.move, move_notation, side_to_move);
+
+            printf("bestmove %s\n", move_notation);
+        } else if (strncmp(line, "print", 5) == 0) {
+            PositionList pl = { 0 };
+            Position positions[64];
+            pl.positions = positions;
+
+            Board b = get_pins(gs, S_WHITE);
+
+            bitboard_to_position_list(b, &pl);
+
+            print_game_state(gs, &pl);
+            printf("%s to move\n", gs->turn == S_WHITE ? "white" : "black");
+        } else {
+            printf("Unknown command: %s\n", line);
+        }
+        fflush(stdout);
+    }
+}
+
 int main(int argc, char* argv[]) {
     GameState gs = { 0 };
 
@@ -1606,69 +1881,16 @@ int main(int argc, char* argv[]) {
     (void)update_all_piece_stores(&gs);
 
     TranspositionTable tt = new_tt(1e8);
-    printf("TT capacity: %fGiB\n", (float)(tt.capacity * sizeof(TranspositionTableEntry)) / (float)(1024 * 1024 * 1024));
+    // printf("TT capacity: %f GiB\n", (float)(tt.capacity * sizeof(TranspositionTableEntry)) / (float)(1024 * 1024 * 1024));
 
     #define move(m) apply_move(&gs, notation_to_move(m, &gs))
 
     // FIXME: This causes a segfault when you try to calculate the next move.
     // gs = parse_FEN("Knnnkbnn/pppppnpp/n1nnnnnn/nqnnrQnn/nnbNPpnn/nnnnnnPn/PPPPnPnP/RNB2B1R b A e3 0 1");
 
-    // move("e2e4");
-    // move("e7e6");
-    // move("d2d4");
-    // move("d7d6");
-    // move("b1c3");
-    // move("e8e7");
-    // gs.turn = S_WHITE;
+    play_self_loop(&gs, &tt);
+    UCI_loop(&gs, &tt);
 
-    print_game_state(&gs, NULL);
-
-    for (int move = 0; true; move++) {
-        printf("%s to move.\n", gs.turn == S_WHITE ? "White" : "Black");
-        printf("Thinking...\n");
-
-        EvaluatedMove em = minimax(6, &gs, -INFINITY, INFINITY, &tt);
-
-        PositionList pl = { 0 };
-        Position positions[2] = { em.move.data.from, em.move.data.to };
-        pl.positions = positions;
-        pl.length = 2;
-
-        if (em.eval == INFINITY || em.eval == -INFINITY) {
-            printf("%s has forced mate!\n", em.eval > 0 ? "White" : "Black");
-
-            MoveList ml = { 0 };
-            Move moves[128];
-            ml.moves = moves;
-            get_all_legal_moves(&gs, &ml);
-            if (ml.length == 0) {
-                printf("Stalemate!\n");
-                break;
-            }
-            em.move = ml.moves[0];
-            positions[0] = em.move.data.from;
-            positions[1] = em.move.data.to;
-            // break;
-        }
-
-        char move_notation[12];
-        move_to_notation(em.move, move_notation);
-        printf("Playing move: %s\n", move_notation);
-        printf("Eval: %f\n", em.eval);
-        // printf("B_K_CASTLE: %d\n", gs.side[S_BLACK].can_castle_k);
-        // printf("B_Q_CASTLE: %d\n", gs.side[S_BLACK].can_castle_q);
-        // printf("W_K_CASTLE: %d\n", gs.side[S_WHITE].can_castle_k);
-        // printf("W_Q_CASTLE: %d\n", gs.side[S_WHITE].can_castle_q);
-
-
-        apply_move(&gs, em.move);
-        print_game_state(&gs, &pl);
-
-        if (gs.game_result != R_PLAYING) {
-            printf("Final Eval: %f\n", evaluate(&gs));
-            break;
-        }
-    }
 
     return 0;
 }
