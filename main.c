@@ -29,6 +29,7 @@ typedef struct {
     Board all_pieces;
     Board attacks;
     Board pinned_pieces;
+    Board pins_attack_paths[64];
     bool in_check;
     Board check_attack_path;
     bool can_castle_k;
@@ -383,10 +384,14 @@ typedef struct {
     Board en_passant_moves;
 } PawnMoves;
 
-#define CHECK_PINS Board __pos_mask = pos_to_bitboard(pos); \
+
+
+#define CHECK_PINS(attack_fn) Board __pos_mask = pos_to_bitboard(pos); \
     Board __pinned_mask = gs->side[gs->turn].pinned_pieces; \
     if ((__pos_mask & __pinned_mask) != 0) { \
-        return 0; \
+        Board __pin_attack_path = gs->side[gs->turn].pins_attack_paths[pos]; \
+        Board __own_pieces = gs->side[gs->turn].all_pieces; \
+        return (attack_fn(pos, gs) & __pin_attack_path) & ~__own_pieces; \
     }
 
 void assert_piece_exists(Piece p, Position pos, GameState* gs) {
@@ -417,10 +422,13 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
     SideId side_id = gs->turn;
     SideId op_side = !side_id;
 
+    Board attacks = pawn_attacks(pos, gs);
+
     Board pawn_mask = pos_to_bitboard(pos);
     Board pinned_mask = gs->side[gs->turn].pinned_pieces;
     if ((pawn_mask & pinned_mask) != 0) {
         PawnMoves pm = { 0 };
+        pm.all_moves = attacks & gs->side[gs->turn].pins_attack_paths[pos];
         return pm;
     }
 
@@ -428,8 +436,6 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
 
     Board board_all = gs->all_pieces;
     Board board_op = gs->side[op_side].all_pieces;
-
-    Board attacks = pawn_attacks(pos, gs);
 
     moves |= board_op & pawn_attacks(pos, gs);
 
@@ -554,7 +560,7 @@ Board knight_attacks(Position pos, GameState* gs) {
 Board knight_legal_moves(Position pos, GameState* gs) {
     assert_piece_exists(P_KNIGHT, pos, gs);
 
-    CHECK_PINS
+    CHECK_PINS(knight_attacks)
 
     Board moves = knight_attacks(pos, gs);
     moves &= ~gs->side[gs->turn].all_pieces;
@@ -645,7 +651,7 @@ Board rook_attacks(Position pos, GameState* gs) {
 Board rook_legal_moves(Position pos, GameState* gs) {
     assert_piece_exists(P_ROOK, pos, gs);
 
-    CHECK_PINS
+    CHECK_PINS(rook_attacks)
 
     Board moves = rook_attacks(pos, gs);
     moves &= ~gs->side[gs->turn].all_pieces;
@@ -673,7 +679,7 @@ Board bishop_attacks(Position pos, GameState* gs) {
 Board bishop_legal_moves(Position pos, GameState* gs) {
     assert_piece_exists(P_BISHOP, pos, gs);
 
-    CHECK_PINS
+    CHECK_PINS(bishop_attacks)
 
     Board moves = bishop_attacks(pos, gs);
     moves &= ~gs->side[gs->turn].all_pieces;
@@ -697,7 +703,7 @@ Board queen_attacks(Position pos, GameState* gs) {
 Board queen_legal_moves(Position pos, GameState* gs) {
     assert_piece_exists(P_QUEEN, pos, gs);
 
-    CHECK_PINS
+    CHECK_PINS(queen_attacks)
 
     Board moves = queen_attacks(pos, gs);
     moves &= ~gs->side[gs->turn].all_pieces;
@@ -938,7 +944,7 @@ bool move_should_be_promo(Move* move) {
     return move->data.piece == P_PAWN && (row == 0 || row == 7);
 }
 
-void check_if_piece_pins(GameState* gs, Board* pins,
+Board check_if_piece_pins(GameState* gs,
     Position blocker_pos, Position p, int dir) {
 
     Piece piece_type = piece_at(p, gs);
@@ -946,25 +952,22 @@ void check_if_piece_pins(GameState* gs, Board* pins,
     switch (piece_type) {
         case P_ROOK: {
             if ((dir + 1) % 2 == 0) {
-                *pins |= pos_to_bitboard(blocker_pos);
+                return pos_to_bitboard(blocker_pos);
             }
-            break;
         }
         case P_BISHOP: {
             if (dir % 2 == 0) {
-                *pins |= pos_to_bitboard(blocker_pos);
+                return pos_to_bitboard(blocker_pos);
             }
-            break;
         }
         case P_QUEEN: {
-            *pins |= pos_to_bitboard(blocker_pos);
-            break;
+            return pos_to_bitboard(blocker_pos);
         }
-        default: break;
+        default: return 0;
     }
 }
 
-Board get_pins(GameState* gs, SideId side) {
+void get_pins(GameState* gs, SideId side) {
     Position king_pos = pos_from_bitboard(gs->side[side].piece[P_KING]);
     int king_row = row_from_pos(king_pos);
     int king_col = col_from_pos(king_pos);
@@ -980,10 +983,13 @@ Board get_pins(GameState* gs, SideId side) {
         { 0, 1 },
     };
 
-    Board pins = 0;
+    Board attack_path;
+
+    gs->side[side].pinned_pieces = 0;
 
     for (int dir = 0; dir < 8; dir++) {
         Position blocker_pos = 65;
+        attack_path = 0;
         for (int dist = 1; true; dist++) {
             int row = king_row + dirs[dir].y * dist;
             int col = king_col + dirs[dir].x * dist;
@@ -994,6 +1000,7 @@ Board get_pins(GameState* gs, SideId side) {
             Position p = pos_from_row_and_col(row, col);
 
             Board mask = pos_to_bitboard(p);
+            attack_path |= mask;
 
             if ((gs->side[side].all_pieces & mask) != 0) {
                 if (blocker_pos == 65) {
@@ -1004,14 +1011,16 @@ Board get_pins(GameState* gs, SideId side) {
                 }
             } else if ((gs->side[!side].all_pieces & mask) != 0) {
                 if (blocker_pos != 65) {
-                    check_if_piece_pins(gs, &pins, blocker_pos, p, dir);
+                    Board pinned_blocker = check_if_piece_pins(gs, blocker_pos, p, dir);
+                    if (pinned_blocker != 0) {
+                        gs->side[side].pins_attack_paths[blocker_pos] = attack_path;
+                        gs->side[side].pinned_pieces |= pinned_blocker;
+                    }
                 }
                 break;
             }
         }
     }
-
-    return pins;
 }
 
 void get_all_legal_moves(GameState* gs, MoveList* out) {
@@ -1238,13 +1247,13 @@ float evaluate(GameState* gs) {
     float castle_rights = gs->side[S_WHITE].can_castle_k + gs->side[S_WHITE].can_castle_q
         - (gs->side[S_BLACK].can_castle_k + gs->side[S_BLACK].can_castle_q);
 
-    float pins = set_bits_count(gs->side[S_BLACK].pinned_pieces)
+    float absolute_pins = set_bits_count(gs->side[S_BLACK].pinned_pieces)
         - set_bits_count(gs->side[S_WHITE].pinned_pieces);
 
     return material_eval(gs) * 1.5
         + castle_rights * 0.4
         + checks * 1.2
-        + pins * 0.9
+        + absolute_pins * 0.9
         + evaluate_pawn_structure(gs) * 0.4
         + evaluate_center_control(gs) * 0.9
         + evaluate_king_safety(gs) * 0.6;
@@ -1414,82 +1423,8 @@ GameState parse_FEN(char* fen) {
     return gs;
 }
 
-void apply_move(GameState* gs, Move move) {
-    assert(move_is_legal(gs, move));
-    assert(gs->game_result == R_PLAYING);
-
-    gs->en_passant = 0;
-
-    Piece piece = move.data.piece;
-
-    if (move.data.castle != CASTLE_NONE) {
-        castle(gs, move.data.castle);
-        gs->side[gs->turn].did_castle = true;
-    } else {
-        // TODO: refactor this into a function
-        Board from = pos_to_bitboard(move.data.from);
-        Board to = pos_to_bitboard(move.data.to);
-
-        SideId side_id = gs->turn;
-        SideId op_side = !side_id;
-
-        assert(gs->side[side_id].piece[piece] & from);
-
-        gs->side[side_id].piece[piece] &= ~from;
-        gs->side[side_id].piece[piece] |= to;
-
-        if (gs->side[op_side].all_pieces & to) {
-            for (int i = 0; i < 6; i++) {
-                gs->side[op_side].piece[i] &= ~to;
-            }
-        }
-
-        if (piece == P_PAWN) {
-            handle_pawn(gs, move);
-        }
-
-    }
-
+void update_game_state_info(GameState* gs) {
     update_all_piece_stores(gs);
-    // Board update complete.
-
-    // Revoke opponents castling rights if we just moved to
-    // either of their rook's starting positions.
-    if (!gs->side[!gs->turn].lost_k_castle_rights) {
-        Board k_side = gs->turn != S_WHITE
-            ? notation_to_pos("h1")
-            : notation_to_pos("h8");
-        if (move.data.to == k_side) {
-            gs->side[!gs->turn].lost_k_castle_rights = true;
-        }
-    }
-
-    if (!gs->side[!gs->turn].lost_q_castle_rights) {
-        Board q_side = gs->turn != S_WHITE
-            ? notation_to_pos("a1")
-            : notation_to_pos("a8");
-        if (move.data.to == q_side) {
-            gs->side[!gs->turn].lost_q_castle_rights = true;
-        }
-    }
-
-    if (piece == P_KING) {
-        gs->side[gs->turn].lost_k_castle_rights = true;
-        gs->side[gs->turn].lost_q_castle_rights = true;
-    } else if (piece == P_ROOK) {
-        Board k_side = gs->turn == S_WHITE
-            ? notation_to_pos("h1")
-            : notation_to_pos("h8");
-        Board q_side = gs->turn == S_WHITE
-            ? notation_to_pos("a1")
-            : notation_to_pos("a8");
-
-        if (move.data.from == k_side) {
-            gs->side[gs->turn].lost_k_castle_rights = true;
-        } else if (move.data.from == q_side) {
-            gs->side[gs->turn].lost_q_castle_rights = true;
-        }
-    }
 
     for (SideId s = 0; s < 2; s++) {
         gs->side[s].attacks = get_side_attacks(gs, s);
@@ -1531,12 +1466,10 @@ void apply_move(GameState* gs, Move move) {
         gs->game_result = R_DRAW;
     }
 
-    gs->side[S_WHITE].pinned_pieces = get_pins(gs, S_WHITE);
-    gs->side[S_BLACK].pinned_pieces = get_pins(gs, S_BLACK);
+    (void)get_pins(gs, S_WHITE);
+    (void)get_pins(gs, S_BLACK);
 
-    gs->turn = !gs->turn;
-
-    if (gs->side[gs->turn].in_check) {
+    if (gs->side[!gs->turn].in_check) {
         // Checkmate
         MoveList ml = { 0 };
         Move moves[128];
@@ -1545,9 +1478,101 @@ void apply_move(GameState* gs, Move move) {
         get_all_legal_moves(gs, &ml);
 
         if (ml.length == 0) {
-            gs->game_result = gs->turn == S_WHITE ? R_BLACK_WON : R_WHITE_WON;
+            gs->game_result = (!gs->turn) == S_WHITE ? R_BLACK_WON : R_WHITE_WON;
+        }
+    } else {
+        // Stalemate
+        MoveList ml = { 0 };
+        Move moves[128];
+        ml.moves = moves;
+
+        get_all_legal_moves(gs, &ml);
+
+        if (ml.length == 0) {
+            gs->game_result = R_DRAW;
         }
     }
+}
+
+void apply_move(GameState* gs, Move move) {
+    assert(move_is_legal(gs, move));
+    assert(gs->game_result == R_PLAYING);
+
+    gs->en_passant = 0;
+
+    Piece piece = move.data.piece;
+
+    if (move.data.castle != CASTLE_NONE) {
+        castle(gs, move.data.castle);
+        gs->side[gs->turn].did_castle = true;
+    } else {
+        // TODO: refactor this into a function
+        Board from = pos_to_bitboard(move.data.from);
+        Board to = pos_to_bitboard(move.data.to);
+
+        SideId side_id = gs->turn;
+        SideId op_side = !side_id;
+
+        assert(gs->side[side_id].piece[piece] & from);
+
+        gs->side[side_id].piece[piece] &= ~from;
+        gs->side[side_id].piece[piece] |= to;
+
+        if (gs->side[op_side].all_pieces & to) {
+            for (int i = 0; i < 6; i++) {
+                gs->side[op_side].piece[i] &= ~to;
+            }
+        }
+
+        if (piece == P_PAWN) {
+            handle_pawn(gs, move);
+        }
+
+    }
+
+    // Board update complete.
+
+    // Revoke opponents castling rights if we just moved to
+    // either of their rook's starting positions.
+    if (!gs->side[!gs->turn].lost_k_castle_rights) {
+        Board k_side = gs->turn != S_WHITE
+            ? notation_to_pos("h1")
+            : notation_to_pos("h8");
+        if (move.data.to == k_side) {
+            gs->side[!gs->turn].lost_k_castle_rights = true;
+        }
+    }
+
+    if (!gs->side[!gs->turn].lost_q_castle_rights) {
+        Board q_side = gs->turn != S_WHITE
+            ? notation_to_pos("a1")
+            : notation_to_pos("a8");
+        if (move.data.to == q_side) {
+            gs->side[!gs->turn].lost_q_castle_rights = true;
+        }
+    }
+
+    if (piece == P_KING) {
+        gs->side[gs->turn].lost_k_castle_rights = true;
+        gs->side[gs->turn].lost_q_castle_rights = true;
+    } else if (piece == P_ROOK) {
+        Board k_side = gs->turn == S_WHITE
+            ? notation_to_pos("h1")
+            : notation_to_pos("h8");
+        Board q_side = gs->turn == S_WHITE
+            ? notation_to_pos("a1")
+            : notation_to_pos("a8");
+
+        if (move.data.from == k_side) {
+            gs->side[gs->turn].lost_k_castle_rights = true;
+        } else if (move.data.from == q_side) {
+            gs->side[gs->turn].lost_q_castle_rights = true;
+        }
+    }
+
+    update_game_state_info(gs);
+
+    gs->turn = !gs->turn;
 }
 
 void generate_cols() {
@@ -1732,9 +1757,9 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta, Transpo
 }
 
 EvaluatedMove engine_move(GameState* gs, TranspositionTable* tt) {
-    EvaluatedMove em = minimax(6, gs, -INFINITY, INFINITY, tt);
+    EvaluatedMove em = minimax(5, gs, -INFINITY, INFINITY, tt);
 
-    if (em.eval == INFINITY || em.eval == -INFINITY) {
+    if (is_null_move(&em.move)) {
         // printf("%s has forced mate!\n", em.eval > 0 ? "White" : "Black");
 
         MoveList ml = { 0 };
@@ -1767,6 +1792,11 @@ void play_self_loop(GameState* gs, TranspositionTable* tt) {
         char move_notation[12];
         move_to_notation(em.move, move_notation, side_to_move);
 
+        if (is_null_move(&em.move)) {
+            printf("Stalemate!\n");
+            break;
+        }
+
         printf("Playing move: %s\n", move_notation);
         printf("Eval: %f\n", em.eval);
 
@@ -1796,8 +1826,6 @@ void apply_move_list(char* str, GameState* gs) {
 
             move_buf[move_buf_len] = 0;
 
-            printf("move: %s\n", move_buf);
-
             GameState tmp_gs = *gs;
 
             Move move = notation_to_move(move_buf, &tmp_gs);
@@ -1819,7 +1847,7 @@ void UCI_loop(GameState* gs, TranspositionTable* tt) {
         if (strncmp(line, "ucinewgame", 10) == 0) {
             (void)reset_game(gs);
             (void)set_up_board(gs);
-            (void)update_all_piece_stores(gs);
+            (void)update_game_state_info(gs);
         } else if (strncmp(line, "uci", 3) == 0) {
             printf("id name %s\n", ENGINE_NAME);
             printf("id author %s\n", ENGINE_AUTHOR);
@@ -1833,7 +1861,7 @@ void UCI_loop(GameState* gs, TranspositionTable* tt) {
             if (strncmp(pos, "startpos", 8) == 0) {
                 (void)reset_game(gs);
                 (void)set_up_board(gs);
-                (void)update_all_piece_stores(gs);
+                (void)update_game_state_info(gs);
                 pos += 9;
             } else if (strncmp(pos, "fen", 3) == 0) {
                 pos += 4;
@@ -1854,15 +1882,7 @@ void UCI_loop(GameState* gs, TranspositionTable* tt) {
 
             printf("bestmove %s\n", move_notation);
         } else if (strncmp(line, "print", 5) == 0) {
-            PositionList pl = { 0 };
-            Position positions[64];
-            pl.positions = positions;
-
-            Board b = get_pins(gs, S_WHITE);
-
-            bitboard_to_position_list(b, &pl);
-
-            print_game_state(gs, &pl);
+            print_game_state(gs, NULL);
             printf("%s to move\n", gs->turn == S_WHITE ? "white" : "black");
         } else {
             printf("Unknown command: %s\n", line);
@@ -1888,9 +1908,18 @@ int main(int argc, char* argv[]) {
     // FIXME: This causes a segfault when you try to calculate the next move.
     // gs = parse_FEN("Knnnkbnn/pppppnpp/n1nnnnnn/nqnnrQnn/nnbNPpnn/nnnnnnPn/PPPPnPnP/RNB2B1R b A e3 0 1");
 
-    play_self_loop(&gs, &tt);
+    // GameState gs_ = parse_FEN("2r1nrk1/p2q1ppp/bp1p4/n1pPp3/P1P1P3/2PBB1N1/4QPPP/R4RK1 w - - bm f4");
+    // update_all_piece_stores(&gs_);
+
+    // play_self_loop(&gs_, &tt);
     UCI_loop(&gs, &tt);
 
+    // FIXME: position startpos moves g2g3 c7c6 f1g2 d7d5 g1f3 h7h6 e1g1 h8h7 d2d4 c8f5 b1c3 f7f6 c1f4 g7g5 f4e3 h7g7 d1d2 d8b6 a1d1 a7a6 b2b3 h6h5 h2h4 g5h4 g3h4 f5h3 e3g5 h3g2 f1e1 g2f3 g1f1 f3e4 g5f4 e4g2 f1g1 g2e4 g1h2 b6d8 f4h6 g8h6 d2h6 d8d6 h6f4 a6a5 e2e3 e4c2 d1d2 g7g4 f4d6
+    // This is a abs pinned piece taking the piece pinning it.
+
+    // FIXME: position startpos moves e2e4 e7e6 d2d4 g7g6 g1f3 b8c6 b1c3 f8b4 f1b5 a7a6 b5c6 b7c6 c1d2 h7h6 e1g1 b4a5 d2f4 h8h7 d4d5 a5c3 b2c3 e8f8 d1d4 g6g5 f4e5 d7d6 d5c6 g5g4 f3h4 d6e5 d4e5 d8h4 e5c5 h4e7 c5b4 f8g7 a1e1 e7b4 c3b4 a8b8 c2c3 a6a5 a2a3 c8a6 c3c4 a6c4 e1e3 c4f1 g1f1 b8b4 e3g3 b4e4 f2f3 g3f3 e4e5 f3f4
+    // 2023-10-15 21:32:35.094-->1:go infinite
+    // 2023-10-15 21:32:35.096<--1:engine: main.c:394: void assert_piece_exists(Piece, Position, GameState *): Assertion `gs->side[gs->turn].piece[p] & pos_to_bitboard(pos)' failed.
 
     return 0;
 }
