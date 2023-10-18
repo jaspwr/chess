@@ -431,7 +431,10 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
     SideId side_id = gs->turn;
     SideId op_side = !side_id;
 
-    Board attacks = pawn_attacks(pos, gs);
+    Board board_all = gs->all_pieces;
+    Board board_op = gs->side[op_side].all_pieces;
+
+    Board attacks = board_op & pawn_attacks(pos, gs);
 
     Board pawn_mask = pos_to_bitboard(pos);
     Board pinned_mask = gs->side[gs->turn].pinned_pieces;
@@ -443,10 +446,7 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
 
     assert(gs->side[side_id].piece[P_PAWN] & pawn_mask);
 
-    Board board_all = gs->all_pieces;
-    Board board_op = gs->side[op_side].all_pieces;
-
-    moves |= board_op & pawn_attacks(pos, gs);
+    moves |= pawn_attacks(pos, gs);
 
     Position advances[2] = { 0 };
     PositionList advances_list = { 0 };
@@ -1547,6 +1547,11 @@ float evaluate_center_control(GameState* gs) {
     return eval;
 }
 
+float bool_to_float(bool b) {
+    // The implicit cast was causing issues sometimes.
+    return b ? 1.0f : 0.0f;
+}
+
 float evaluate_king_safety(GameState* gs);
 
 float evaluate(GameState* gs) {
@@ -1557,22 +1562,47 @@ float evaluate(GameState* gs) {
         default: break;
     }
 
-    float checks = -gs->side[S_WHITE].in_check + gs->side[S_BLACK].in_check;
+    float checks = -bool_to_float(gs->side[S_WHITE].in_check)
+        + bool_to_float(gs->side[S_BLACK].in_check);
 
-    float castle_rights = gs->side[S_WHITE].can_castle_k + gs->side[S_WHITE].can_castle_q
-        - (gs->side[S_BLACK].can_castle_k + gs->side[S_BLACK].can_castle_q);
+    float white_castle_rights = bool_to_float(gs->side[S_WHITE].lost_k_castle_rights)
+        + bool_to_float(gs->side[S_WHITE].lost_q_castle_rights);
+
+    float black_castle_rights = bool_to_float(gs->side[S_BLACK].lost_k_castle_rights)
+        + bool_to_float(gs->side[S_BLACK].lost_q_castle_rights);
+
+    float castle_rights = -white_castle_rights + black_castle_rights;
 
     float absolute_pins = set_bits_count(gs->side[S_BLACK].pinned_pieces)
         - set_bits_count(gs->side[S_WHITE].pinned_pieces);
 
-    return evaluate_material(gs) * 1.5
+    #ifdef DEBUG_EVAL
+        printf("------ Eval breakdown ------\n");
+        printf("material: %f\n", evaluate_material(gs));
+        printf("castle_rights: %f\n", castle_rights);
+        printf("checks: %f\n", checks);
+        printf("absolute_pins: %f\n", absolute_pins);
+        printf("pawn_structure: %f\n", evaluate_pawn_structure(gs));
+        printf("center_control: %f\n", evaluate_center_control(gs));
+        printf("king_safety: %f\n", evaluate_king_safety(gs));
+        printf("piece_square_tables: %f\n", evaluate_piece_square_tables(gs));
+        printf("----------------------------\n");
+    #endif
+
+    float total_eval = evaluate_material(gs) * 1.5
         + castle_rights * 0.4
         + checks * 1.4
         + absolute_pins * 0.9
         + evaluate_pawn_structure(gs) * 0.4
-        + evaluate_center_control(gs) * 0.9
+        + evaluate_center_control(gs) * 1.2
         + evaluate_king_safety(gs) * 0.6
-        + evaluate_piece_square_tables(gs);
+        + evaluate_piece_square_tables(gs) * 1.05;
+
+    assert(!isnan(total_eval));
+    // This is an arbitrary value but it should never be this high.
+    assert(!(!isinf(total_eval) && fabs(total_eval) > 1000000));
+
+    return total_eval;
 }
 
 bool drawn_by_repetition(GameState* gs) {
