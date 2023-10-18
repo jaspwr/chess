@@ -6,6 +6,8 @@
 #include <ctype.h>
 #include <nmmintrin.h>
 
+#include "psv/psv.h"
+
 typedef enum { false, true } bool;
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -1421,6 +1423,78 @@ float evaluate_material(GameState* gs) {
     return eval;
 }
 
+Position invert_board(Position pos) {
+    int row = row_from_pos(pos);
+    int col = col_from_pos(pos);
+    return pos_from_row_and_col(7 - row, col);
+}
+
+float lerp(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+float evaluate_piece_square_tables(GameState* gs) {
+    float eval = 0.0f;
+
+    for (SideId side = 0; side < 2; side++) {
+        float sign = side == S_WHITE ? 1.0f : -1.0f;
+
+        float pieces_on_board = set_bits_count(gs->all_pieces) / 32.0f;
+
+        for (Piece p = 0; p < 6; p++) {
+            PositionList pl = { 0 };
+            Position positions[64];
+            pl.positions = positions;
+
+            (void)bitboard_to_position_list(gs->side[side].piece[p], &pl);
+
+            for (int i = 0; i < pl.length; i++) {
+                Position pos = side == S_WHITE
+                    ? pl.positions[i]
+                    : invert_board(pl.positions[i]);
+
+                assert(position_is_legal(pos));
+
+                switch (p) {
+                    case P_PAWN: {
+                        eval += sign * PSV_PAWN[pos];
+                        break;
+                    }
+                    case P_KNIGHT: {
+                        eval += sign * PSV_KNIGHT[pos];
+                        break;
+                    }
+                    case P_BISHOP: {
+                        eval += sign * PSV_CENTRALISATION[pos];
+                        break;
+                    }
+                    case P_ROOK: {
+                        eval += sign * lerp(PSV_ROOK_OPENING[pos], PSV_CENTRALISATION[pos],
+                            1.0f - pieces_on_board);
+
+                        break;
+                    }
+                    case P_QUEEN: {
+                        eval += sign * lerp(PSV_ROOK_OPENING[pos], PSV_CENTRALISATION[pos],
+                            1.0f - pieces_on_board);
+
+                        break;
+                    }
+                    case P_KING: {
+                        eval += sign * lerp(PSV_KING_OPENING[pos], PSV_CENTRALISATION[pos],
+                            1.0f - pieces_on_board);
+
+                        break;
+                    }
+                    default: assert(false);
+                }
+            }
+        }
+    }
+
+    return eval;
+}
+
 int set_bits_in_col(Board b, int col) {
     return set_bits_count(b & COLS[col]);
 }
@@ -1493,11 +1567,12 @@ float evaluate(GameState* gs) {
 
     return evaluate_material(gs) * 1.5
         + castle_rights * 0.4
-        + checks * 1.2
+        + checks * 1.4
         + absolute_pins * 0.9
         + evaluate_pawn_structure(gs) * 0.4
         + evaluate_center_control(gs) * 0.9
-        + evaluate_king_safety(gs) * 0.6;
+        + evaluate_king_safety(gs) * 0.6
+        + evaluate_piece_square_tables(gs);
 }
 
 bool drawn_by_repetition(GameState* gs) {
@@ -2096,7 +2171,7 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta, Transpo
 }
 
 EvaluatedMove engine_move(GameState* gs, TranspositionTable* tt) {
-    EvaluatedMove em = minimax(6, gs, -INFINITY, INFINITY, tt);
+    EvaluatedMove em = minimax(5, gs, -INFINITY, INFINITY, tt);
 
     if (is_null_move(&em.move)) {
         // printf("%s has forced mate!\n", em.eval > 0 ? "White" : "Black");
@@ -2144,6 +2219,8 @@ void play_self_loop(GameState* gs, TranspositionTable* tt) {
         pl.length = 2;
 
         print_game_state(gs, &pl);
+
+        printf("PSV: %f\n", evaluate_piece_square_tables(gs));
 
         if (gs->game_result != R_PLAYING) {
             printf("Final Eval: %f\n", evaluate(gs));
