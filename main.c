@@ -446,7 +446,7 @@ PawnMoves pawn_legal_moves(Position pos, GameState* gs) {
 
     assert(gs->side[side_id].piece[P_PAWN] & pawn_mask);
 
-    moves |= pawn_attacks(pos, gs);
+    moves |= attacks;
 
     Position advances[2] = { 0 };
     PositionList advances_list = { 0 };
@@ -2368,6 +2368,9 @@ int main(int argc, char* argv[]) {
     // 2023-10-15 21:32:35.096<--1:engine: main.c:394: void assert_piece_exists(Piece, Position, GameState *): Assertion `gs->side[gs->turn].piece[p] & pos_to_bitboard(pos)' failed.
 
     // FIXME: position startpos moves g2g3 c7c6 f1g2 d7d5 g1f3 h7h6 e1g1 h8h7 d2d4 c8f5 c1f4 g7g5 f3h4 g5f4 h4f5 e7e6 b1c3 e6f5 d1d3 d8d6 d3f5 d6d8 f5h7 d8c7 h7g8 e8e7 g8h7 b7b5 e2e4 b5b4 c3e2 d5e4 e2f4 f8g7 h7g7 b8a6 g7h6 a8g8 h6h7 c7b8 a1e1 b8b6 e1e4 e7d8 h7g8 d8c7 g8f7
+
+    // FIXME: position startpos moves e2e4 e7e6 b1c3 g8f6 f1c4 b8c6 d1h5 f8b4 g1f3 c6d4 e1g1 d4e2 g1h1 b4c3 d2c3 f6d5 e4d5 e2g3 h2g3 g7g6 h5g5 d8f6 g5f6 b7b5 c1g5 e8f8
+    // a2b3 is legal for some reason
 
     return 0;
 }
