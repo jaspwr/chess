@@ -4,19 +4,27 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+
+#ifdef SSE
 #include <nmmintrin.h>
+#endif
+
+// #define WASM
 
 #include "psv/psv.h"
 
 typedef enum { false, true } bool;
-typedef unsigned long u64;
+typedef unsigned long long u64;
 typedef unsigned int u32;
 typedef unsigned char u8;
+typedef long long i64;
+typedef int i32;
+typedef char i8;
 
 typedef u64 Board;
 typedef u8 Position;
 
-#define ENGINE_NAME "goat"
+#define ENGINE_NAME "some_engine"
 #define ENGINE_AUTHOR "jasper"
 
 Position pos_from_bitboard(Board b);
@@ -133,7 +141,7 @@ Board _side_pieces(SideId side, GameState* gs) {
 }
 
 u64 hash_position(GameState* gs) {
-    u64 hash = 0xc0ffeeUL;
+    u64 hash = 0xc0ffeeULL;
     for (u64 i = 0UL; i < 6UL; i++) {
         hash ^= gs->side[S_WHITE].piece[i];
         hash += i;
@@ -154,7 +162,7 @@ u64 hash_position(GameState* gs) {
 void print_bitboard(Board board) {
     for (int row = 7; row >= 0; row--) {
         for (int col = 0; col < 8; col++) {
-            printf("%lu", ((board >> (row * 8 + col)) & 1UL));
+            printf("%llu", ((board >> (row * 8 + col)) & 1UL));
             if (col != 7) {
                 printf(" ");
             }
@@ -190,7 +198,7 @@ Position pos_from_row_and_col(int row, int col) {
 }
 
 Board pos_to_bitboard(Position pos) {
-    return 1UL << pos;
+    return 1ULL << pos;
 }
 
 Position notation_to_pos(char* str) {
@@ -371,7 +379,16 @@ Board position_list_to_bitboard(PositionList* list) {
 }
 
 int set_bits_count(Board value) {
+    #ifdef SSE
     return _mm_popcnt_u64(value);
+    #else
+    int count = 0;
+    while (value != 0) {
+        count += value & 1;
+        value >>= 1;
+    }
+    return count;
+    #endif
 }
 
 int bitscan_reverse(Board value) {
@@ -384,7 +401,7 @@ void bitboard_to_position_list(Board b, PositionList* out) {
     while (b != 0) {
         int pos = bitscan_reverse(b);
         out->positions[out->length++] = pos;
-        b &= ~(1UL << pos);
+        b &= ~(1ULL << pos);
     }
 }
 
@@ -405,7 +422,8 @@ typedef struct {
 
 void assert_piece_exists(Piece p, Position pos, GameState* gs) {
     assert(position_is_legal(pos));
-    assert(gs->side[gs->turn].piece[p] & pos_to_bitboard(pos));
+
+    assert((gs->side[gs->turn].piece[p] & pos_to_bitboard(pos)) != 0);
 }
 
 Board pawn_attacks(Position pos, GameState* gs) {
@@ -784,6 +802,7 @@ Board king_attacks(Position pos, GameState* gs) {
 
     // HACK: The king's attacked squares weren't in the attack bitboard.
     //       Probably should be addressed properly.
+
     Position op_king_pos = pos_from_bitboard(gs->side[!gs->turn].piece[P_KING]);
     moves &= ~KING_MOVES_LUT[op_king_pos];
 
@@ -912,10 +931,9 @@ Board magic_bishop_attacks(Position pos, GameState* gs) {
 }
 
 Board bishop_attacks(Position pos, GameState* gs) {
-    return magic_bishop_attacks(pos, gs);
     // return sliding_piece_attacks_from_gs(pos, gs, BISHOP_OFFSETS, 4);
+    return magic_bishop_attacks(pos, gs);
 }
-
 
 Board bishop_legal_moves(Position pos, GameState* gs) {
     assert_piece_exists(P_BISHOP, pos, gs);
@@ -939,7 +957,6 @@ Board queen_attacks(Position pos, GameState* gs) {
 
     return bishop_attacks(pos, gs) | rook_attacks(pos, gs);
 }
-
 
 Board queen_legal_moves(Position pos, GameState* gs) {
     assert_piece_exists(P_QUEEN, pos, gs);
@@ -1518,9 +1535,7 @@ float evaluate_pawn_structure(GameState* gs) {
     for (int col = 0; col < 8; col++) {
         // Doubled pawns
         eval += (float)(set_bits_in_col(black, col) - set_bits_in_col(white, col)) * 0.5f;
-
     }
-
 
     return eval;
 }
@@ -1927,7 +1942,7 @@ void generate_cols() {
 
 void generate_rows() {
     for (int i = 0; i < 8; i++) {
-        ROWS[i] = 0xFFUL << ((u64)i * 8UL);
+        ROWS[i] = 0xFFULL << ((u64)i * 8ULL);
     }
 }
 
@@ -1947,7 +1962,7 @@ void occupancy_permutations(Board mask, Board* buf, int* buf_len, int buf_capaci
     for (u64 perm = 0; perm < permutations; perm++) {
         Board b = 0;
         for (int pos_index = 0; pos_index < pl.length; pos_index++) {
-            if ((perm & (1UL << pos_index)) != 0) {
+            if ((perm & (1ULL << pos_index)) != 0) {
                 b |= pos_to_bitboard(pl.positions[pos_index]);
             }
         }
@@ -1994,7 +2009,7 @@ void generate_magic_bitboards(Board* magic_boards, int hash_space, u64* magic_nu
 
             if (current_value != 0 && current_value != attacked_squares) {
                 #ifndef GENERATE_MAGICS
-                    printf("Pos: %d has an insufficient magic number (%lu).\n", pos, magic);
+                    printf("Pos: %llu has an insufficient magic number (%lu).\n", pos, magic);
                     assert(false && "Hash collision!.");
                 #else
                     magic_numbers[pos] = rand();
@@ -2023,11 +2038,14 @@ void generate_LUTs() {
     (void)generate_rook_LUT();
     (void)generate_bishop_LUT();
 
+    // #ifndef WASM
     (void)generate_magic_bitboards((Board*)ROOK_MAGIC_BOARDS, ROOK_PERMS, ROOK_MAGIC_NUMBERS,
         ROOK_MOVES_LUT, ROOK_OFFSETS, 4, ROOK_SHIFT);
 
     (void)generate_magic_bitboards((Board*)BISHOP_MAGIC_BOARDS, BISHOP_PERMS, BISHOP_MAGIC_NUMBERS,
         BISHOP_MOVES_LUT, (PosOffset*)BISHOP_OFFSETS, 4, BISHOP_SHIFT);
+    // #endif
+
     // (void)generate_magic_bishop();
 }
 
@@ -2195,13 +2213,13 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta, Transpo
 
     }
 
-    insert_into_tt(tt, gs, best_move, depth);
+    // insert_into_tt(tt, gs, best_move, depth);
 
     return best_move;
 }
 
 EvaluatedMove engine_move(GameState* gs, TranspositionTable* tt) {
-    EvaluatedMove em = minimax(5, gs, -INFINITY, INFINITY, tt);
+    EvaluatedMove em = minimax(3, gs, -INFINITY, INFINITY, tt);
 
     if (is_null_move(&em.move)) {
         // printf("%s has forced mate!\n", em.eval > 0 ? "White" : "Black");
@@ -2335,6 +2353,74 @@ void UCI_loop(GameState* gs, TranspositionTable* tt) {
         fflush(stdout);
     }
 }
+
+#ifdef WASM
+// #include <emscripten/emscripten.h>
+#include <emscripten.h>
+
+GameState GLOBAL_GS = { 0 };
+TranspositionTable GLOBAL_TT = { 0 };
+i32 lock = 0; // This should be fine I don't think WASM even has threads.
+
+EMSCRIPTEN_KEEPALIVE
+void WASM_init() {
+    lock--;
+    while (lock < -1) ;;
+
+    srand(0xbadd);
+
+    (void)generate_LUTs();
+
+    (void)set_up_board(&GLOBAL_GS);
+
+    (void)update_all_piece_stores(&GLOBAL_GS);
+
+    GLOBAL_TT = new_tt(1e3);
+
+    lock++;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void WASM_import_game_state(const char* fen) {
+    lock--;
+    while (lock < -1) ;;
+
+    GameState gs = parse_FEN(fen);
+    (void)update_game_state_info(&gs);
+
+    lock++;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void WASM_make_move(const char* move) {
+    lock--;
+    while (lock < -1) ;;
+
+    Move m = notation_to_move(move, &GLOBAL_GS);
+    apply_move(&GLOBAL_GS, m);
+
+    lock++;
+}
+
+EMSCRIPTEN_KEEPALIVE
+char* WASM_generate_move(const char* name) {
+    lock--;
+    while (lock < -1) ;;
+
+    SideId side_to_move = GLOBAL_GS.turn;
+    EvaluatedMove em = engine_move(&GLOBAL_GS, &GLOBAL_TT);
+
+    char move_notation[12];
+    move_to_notation(em.move, move_notation, side_to_move);
+
+    char* move_notation_copy = malloc(strlen(move_notation) + 1);
+    strcpy(move_notation_copy, move_notation);
+
+    lock++;
+
+    return move_notation_copy;
+}
+#endif
 
 int main(int argc, char* argv[]) {
     srand(0xbadd);
