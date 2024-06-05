@@ -27,8 +27,6 @@ typedef u8 Position;
 #define ENGINE_NAME "some_engine"
 #define ENGINE_AUTHOR "jasper"
 
-#define SEARCH_DEPTH 3
-
 Position pos_from_bitboard(Board b);
 
 typedef enum {
@@ -148,41 +146,17 @@ u64 hash_position(GameState* gs) {
         hash ^= gs->side[S_WHITE].piece[i];
         hash += i;
         hash ^= gs->side[S_BLACK].piece[i];
-        hash /= i;
-        hash >>= 1;
+        hash += i;
     }
 
     hash += gs->turn;
     hash ^= gs->en_passant * 0xdecafbadUL;
     hash ^= gs->side[S_WHITE].lost_k_castle_rights * 222UL;
-    hash *= 7;
     hash ^= gs->side[S_WHITE].lost_q_castle_rights * 444UL;
-    hash /= 7;
     hash ^= gs->side[S_BLACK].lost_k_castle_rights * 666UL;
-    hash *= 7;
     hash ^= gs->side[S_BLACK].lost_q_castle_rights * 777UL;
 
     return hash;
-}
-
-bool position_cmp(GameState* gs1, GameState* gs2) {
-    // Hash comparison.
-    if (hash_position(gs1) != hash_position(gs2)) return false;
-
-    // Full comparison in case of hash collision.
-    for (int i = 0; i < 6; i++) {
-        if (gs1->side[S_WHITE].piece[i] != gs2->side[S_WHITE].piece[i]) return false;
-        if (gs1->side[S_BLACK].piece[i] != gs2->side[S_BLACK].piece[i]) return false;
-    }
-
-    if (gs1->turn != gs2->turn) return false;
-    if (gs1->en_passant != gs2->en_passant) return false;
-    if (gs1->side[S_WHITE].lost_k_castle_rights != gs2->side[S_WHITE].lost_k_castle_rights) return false;
-    if (gs1->side[S_WHITE].lost_q_castle_rights != gs2->side[S_WHITE].lost_q_castle_rights) return false;
-    if (gs1->side[S_BLACK].lost_k_castle_rights != gs2->side[S_BLACK].lost_k_castle_rights) return false;
-    if (gs1->side[S_BLACK].lost_q_castle_rights != gs2->side[S_BLACK].lost_q_castle_rights) return false;
-
-    return true;
 }
 
 void print_bitboard(Board board) {
@@ -1650,7 +1624,6 @@ bool drawn_by_repetition(GameState* gs) {
     int count = 0;
     u64 current_board_hash = hash_position(gs);
     for (int i = 0; i < gs->seen_position_hashes_count; i++) {
-        // FIXME: Hash collisions can cause false positives.
         if (current_board_hash == gs->seen_position_hashes[i]) {
             if (++count >= 3) {
                 return true;
@@ -2137,8 +2110,7 @@ float evaluate_king_safety(GameState* gs) {
 }
 
 typedef struct {
-    bool is_null;
-    GameState gs;
+    u64 hash;
     EvaluatedMove move;
     int depth;
 } TranspositionTableEntry;
@@ -2148,31 +2120,19 @@ typedef struct {
     u64 capacity;
 } TranspositionTable;
 
-TranspositionTable new_tt(u64 capacity_bytes) {
-    u64 capacity = capacity_bytes / sizeof(TranspositionTableEntry);
-
+TranspositionTable new_tt(u64 capacity) {
     TranspositionTableEntry* data =
         malloc(sizeof(TranspositionTableEntry) * capacity);
-
-    for (u64 i = 0; i < capacity; i++) {
-        data[i] = (TranspositionTableEntry) { 0 };
-    }
-
     TranspositionTable tt = { data, capacity };
     return tt;
 }
 
 TranspositionTableEntry query_tt(TranspositionTable* tt, GameState* gs) {
     u64 hash = hash_position(gs);
-    TranspositionTableEntry* search_result = &tt->data[hash % tt->capacity];
+    TranspositionTableEntry search_result = tt->data[hash % tt->capacity];
 
-    if (search_result->is_null) {
-        TranspositionTableEntry te = { 0 };
-        return te;
-    }
-
-    if (position_cmp(gs, &search_result->gs)) {
-        return *search_result;
+    if (search_result.hash == hash) {
+        return search_result;
     } else {
         TranspositionTableEntry te = { 0 };
         return te;
@@ -2183,13 +2143,12 @@ void insert_into_tt(TranspositionTable* tt, GameState* gs, EvaluatedMove em, int
     u64 hash = hash_position(gs);
 
     // Depth-Preferred
-    TranspositionTableEntry* existing = &tt->data[hash % tt->capacity];
-    if (position_cmp(gs, &existing->gs) && existing->depth > depth) {
+    TranspositionTableEntry existing = tt->data[hash % tt->capacity];
+    if (existing.hash == hash && existing.depth > depth) {
         return;
     }
 
-    TranspositionTableEntry entry = { true, { 0 }, em, depth };
-    memcpy(&entry.gs, gs, sizeof(GameState));
+    TranspositionTableEntry entry = { hash, em, depth };
 
     tt->data[hash % tt->capacity] = entry;
 }
@@ -2254,13 +2213,13 @@ EvaluatedMove minimax(int depth, GameState* gs, float alpha, float beta, Transpo
 
     }
 
-    insert_into_tt(tt, gs, best_move, depth);
+    // insert_into_tt(tt, gs, best_move, depth);
 
     return best_move;
 }
 
 EvaluatedMove engine_move(GameState* gs, TranspositionTable* tt) {
-    EvaluatedMove em = minimax(SEARCH_DEPTH, gs, -INFINITY, INFINITY, tt);
+    EvaluatedMove em = minimax(3, gs, -INFINITY, INFINITY, tt);
 
     if (is_null_move(&em.move)) {
         // printf("%s has forced mate!\n", em.eval > 0 ? "White" : "Black");
@@ -2476,15 +2435,15 @@ int main(int argc, char* argv[]) {
 
     (void)update_all_piece_stores(&gs);
 
-    TranspositionTable tt = new_tt(2e9);
-    printf("TT capacity: %f GiB\n", (float)(tt.capacity * sizeof(TranspositionTableEntry)) / (float)(1024 * 1024 * 1024));
+    TranspositionTable tt = new_tt(1e8);
+    // printf("TT capacity: %f GiB\n", (float)(tt.capacity * sizeof(TranspositionTableEntry)) / (float)(1024 * 1024 * 1024));
 
     #define move(m) apply_move(&gs, notation_to_move(m, &gs))
 
     // GameState gs_ = parse_FEN("2r1nrk1/p2q1ppp/bp1p4/n1pPp3/P1P1P3/2PBB1N1/4QPPP/R4RK1 w - - bm f4");
     // update_all_piece_stores(&gs_);
 
-    play_self_loop(&gs, &tt);
+    // play_self_loop(&gs, &tt);
     UCI_loop(&gs, &tt);
 
     // FIXME: position startpos moves g2g3 c7c6 f1g2 d7d5 g1f3 h7h6 e1g1 h8h7 d2d4 c8f5 b1c3 f7f6 c1f4 g7g5 f4e3 h7g7 d1d2 d8b6 a1d1 a7a6 b2b3 h6h5 h2h4 g5h4 g3h4 f5h3 e3g5 h3g2 f1e1 g2f3 g1f1 f3e4 g5f4 e4g2 f1g1 g2e4 g1h2 b6d8 f4h6 g8h6 d2h6 d8d6 h6f4 a6a5 e2e3 e4c2 d1d2 g7g4 f4d6
