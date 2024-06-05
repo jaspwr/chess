@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Do regular build. The final compilated can porbably be excluded from this.
+# Do regular build.
 ./build.sh
 
 # WASM build
